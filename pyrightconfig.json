@@ -1,0 +1,23 @@
+{
+  "include": [
+    "workers/src",
+    "workers/tests"
+  ],
+  "exclude": [
+    "**/.venv",
+    "**/__pycache__"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "workers",
+      "extraPaths": [
+        "workers/src"
+      ]
+    }
+  ],
+  "pythonVersion": "3.12",
+  "reportMissingTypeStubs": "none",
+  "typeCheckingMode": "basic",
+  "venv": ".venv",
+  "venvPath": "workers"
+}

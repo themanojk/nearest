@@ -1,0 +1,26 @@
+{
+  "name": "kid-audio-intelligence",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "engines": {
+    "node": "^22.13.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:backend": "npm run start:dev --workspace backend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "dev:workers": "uv run --directory workers uvicorn audio_workers.main:app --reload --port 8000",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f",
+    "install:workers": "uv sync --directory workers",
+    "smoke:upload": "node backend/test/smoke-upload.mjs",
+    "test": "npm run test --workspaces --if-present && uv run --directory workers pytest",
+    "typecheck": "npm run typecheck --workspaces --if-present && uv run --directory workers mypy src",
+    "lint": "npm run lint --workspaces --if-present && uv run --directory workers ruff check ."
+  }
+}

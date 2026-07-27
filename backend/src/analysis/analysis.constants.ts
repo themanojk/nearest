@@ -1,0 +1,14 @@
+export const AUDIO_INGEST_QUEUE = 'audio.ingest';
+export const AUDIO_INGEST_JOB = 'ingest';
+export const AUDIO_SCAN_QUEUE = 'audio.scan';
+export const AUDIO_SCAN_JOB = 'scan';
+export const SPEECH_ASR_QUEUE = 'speech.asr';
+export const SPEECH_ASR_JOB = 'transcribe';
+export const SPEECH_DIARIZATION_QUEUE = 'speech.diarize';
+export const SPEECH_DIARIZATION_JOB = 'diarize';
+export const CONTEXT_CLASSIFICATION_QUEUE = 'context.classify';
+export const CONTEXT_CLASSIFICATION_JOB = 'classify';
+export const ACOUSTIC_EVENT_QUEUE = 'acoustic.events';
+export const ACOUSTIC_EVENT_JOB = 'detect';
+export const RISK_AGGREGATION_QUEUE = 'risk.aggregate';
+export const RISK_AGGREGATION_JOB = 'aggregate';
