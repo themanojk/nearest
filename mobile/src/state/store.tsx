@@ -64,6 +64,7 @@ export type State = {
   transferBytes: number;
   transferTotalBytes: number;
   networkBenchmarkBytesPerSecond: number;
+  networkBenchmarkPacketLossPercent: number | null;
   networkBenchmarkRunning: boolean;
   uploadProgress: number;
   uploadedFileCount: number;
@@ -131,6 +132,7 @@ const baseInitialState: State = {
   transferBytes: 0,
   transferTotalBytes: 0,
   networkBenchmarkBytesPerSecond: 0,
+  networkBenchmarkPacketLossPercent: null,
   networkBenchmarkRunning: false,
   uploadProgress: 0,
   uploadedFileCount: 0,
@@ -214,6 +216,7 @@ function reducer(state: State, action: Action): State {
         transferBytes: 0,
         transferTotalBytes: 0,
         networkBenchmarkBytesPerSecond: 0,
+        networkBenchmarkPacketLossPercent: null,
         networkBenchmarkRunning: false,
         uploadProgress: 0,
         uploadedFileCount: 0,

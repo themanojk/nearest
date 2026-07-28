@@ -33,6 +33,12 @@ RCT_EXTERN_METHOD(benchmarkDownload:(NSString *)url
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(benchmarkUdp:(NSString *)url
+                  token:(NSString *)token
+                  expectedBytes:(double)expectedBytes
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
 RCT_EXTERN_METHOD(uploadFile:(NSString *)jobId
                   url:(NSString *)url
                   path:(NSString *)path

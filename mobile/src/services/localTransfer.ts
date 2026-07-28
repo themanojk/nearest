@@ -17,10 +17,26 @@ type UploadResult = {
   etag?: string;
 };
 
+export type HybridDownloadResult = {
+  missingPackets: number;
+  packetLossPercent: number;
+  path: string;
+  repairedBytes: number;
+  udpBytesPerSecond: number;
+};
+
 export type NetworkBenchmarkResult = {
   bytes: number;
   bytesPerSecond: number;
   elapsedMs: number;
+};
+
+export type UdpNetworkBenchmarkResult = NetworkBenchmarkResult & {
+  duplicates: number;
+  outOfOrder: number;
+  packetLossPercent: number;
+  packetsExpected: number;
+  packetsReceived: number;
 };
 
 type NearNestLocalTransferNative = {
@@ -30,6 +46,11 @@ type NearNestLocalTransferNative = {
     token: string,
     expectedBytes: number,
   ): Promise<NetworkBenchmarkResult>;
+  benchmarkUdp(
+    url: string,
+    token: string,
+    expectedBytes: number,
+  ): Promise<UdpNetworkBenchmarkResult>;
   cancelAll(): Promise<void>;
   connectToHotspot(ssid: string, password: string): Promise<void>;
   deleteCachedPart(path: string): Promise<boolean>;
@@ -41,6 +62,13 @@ type NearNestLocalTransferNative = {
     expectedBytes: number,
     cacheKey: string,
   ): Promise<string>;
+  downloadRangeHybridUdp(
+    jobId: string,
+    url: string,
+    token: string,
+    expectedBytes: number,
+    cacheKey: string,
+  ): Promise<HybridDownloadResult>;
   getAvailableCacheBytes(): Promise<number>;
   getCachedPart(
     cacheKey: string,
@@ -77,6 +105,11 @@ export const localTransfer = {
     token: string,
     expectedBytes: number,
   ) => nativeModule().benchmarkDownload(url, token, expectedBytes),
+  benchmarkUdp: (
+    url: string,
+    token: string,
+    expectedBytes: number,
+  ) => nativeModule().benchmarkUdp(url, token, expectedBytes),
   cancelAll: () => nativeModule().cancelAll(),
   connect: (ssid: string, password: string) =>
     nativeModule().connectToHotspot(ssid, password),
@@ -91,6 +124,20 @@ export const localTransfer = {
     cacheKey: string,
   ) =>
     nativeModule().downloadRange(
+      jobId,
+      url,
+      token,
+      expectedBytes,
+      cacheKey,
+    ),
+  downloadRangeHybridUdp: (
+    jobId: string,
+    url: string,
+    token: string,
+    expectedBytes: number,
+    cacheKey: string,
+  ) =>
+    nativeModule().downloadRangeHybridUdp(
       jobId,
       url,
       token,

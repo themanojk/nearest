@@ -94,9 +94,52 @@ millivolt calibration values live beside it.
 
 `transfer.ap.start` returns the random `ssid`, WPA2 `password`, local
 `baseUrl`, and request `token` over the encrypted BLE status characteristic.
-The phone reads at most 10 MiB at a time from
+The phone reads at most 10 MiB at a time. Android starts with
+`GET /v1/recording/udp?recordingId=...&offsetBytes=...&lengthBytes=...&port=...`.
+Each UDP packet carries a session ID, sequence number, length, and CRC32.
+After the end marker, the app repairs only missing or corrupt runs from
 `GET /v1/recording?recordingId=...&offsetBytes=...&lengthBytes=...`, with the
-token in `X-NearNest-Transfer-Token`.
+token in `X-NearNest-Transfer-Token`. iOS currently uses the resumable TCP
+range endpoint directly.
+
+## Transfer performance
+
+Short physical-device trials use fresh 10 MiB ranges rather than waiting for a
+complete 388 MiB recording. On the current ESP32 and SPI-wired SD card:
+
+| Measurement | Observed result |
+| --- | --- |
+| UDP RAM/network benchmark | Approximately 2.3–2.6 MiB/s |
+| Original recording path | Approximately 0.74 MiB/s |
+| Optimized recording path | Approximately 1.2–1.39 MiB/s |
+| Packet integrity in measured runs | Zero missing/corrupt packets |
+
+The recording path now uses:
+
+- fingerprint-validated high-speed SD transfer mode with safe fallback;
+- direct FAT reads into two sector-aligned buffers;
+- a high-priority SD reader on CPU 1 and UDP/socket work on CPU 0;
+- ESP ROM CRC32;
+- sequence-based Android reassembly with TCP repair;
+- explicit C++ allocation cleanup before FreeRTOS task deletion; and
+- periodic blocking yields so the idle task can service the watchdog.
+
+The SPI SD path remains below the required minimum of 1.5 MiB/s even though
+the Wi-Fi link has sufficient capacity. Meeting that target requires rewiring
+the SD card to the ESP32 SDMMC peripheral:
+
+| SD signal | ESP32 GPIO | Required in 1-bit mode |
+| --- | --- | --- |
+| CLK | 14 | Yes |
+| CMD | 15 | Yes |
+| DAT0 | 2 | Yes |
+| DAT1 | 4 | No |
+| DAT2 | 12 | No |
+| DAT3 | 13 | No |
+
+Use four-bit mode when the socket exposes DAT1 and DAT2. CMD and the connected
+DAT lines require suitable pull-ups. The current source and flashed test
+firmware still use SPI; do not enable SDMMC until the wiring has changed.
 
 ## Transfer safety
 

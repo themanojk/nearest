@@ -1,6 +1,7 @@
 import Foundation
 import NetworkExtension
 import React
+import Darwin
 
 @objc(NearNestLocalTransfer)
 final class NearNestLocalTransfer: RCTEventEmitter, URLSessionDataDelegate, URLSessionTaskDelegate {
@@ -246,6 +247,246 @@ final class NearNestLocalTransfer: RCTEventEmitter, URLSessionDataDelegate, URLS
       contexts[task.taskIdentifier] = context
     }
     task.resume()
+  }
+
+  @objc(benchmarkUdp:token:expectedBytes:resolver:rejecter:)
+  func benchmarkUdp(
+    _ urlString: String,
+    token: String,
+    expectedBytes: Double,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    guard expectedBytes > 0 else {
+      reject("benchmark.invalid_request", "Invalid UDP benchmark size", nil)
+      return
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let descriptor = Darwin.socket(
+        AF_INET,
+        SOCK_DGRAM,
+        Int32(IPPROTO_UDP)
+      )
+      guard descriptor >= 0 else {
+        reject("benchmark.udp_failed", "Could not create the UDP socket", nil)
+        return
+      }
+      defer { Darwin.close(descriptor) }
+
+      var receiveBufferBytes: Int32 = 1024 * 1024
+      _ = withUnsafePointer(to: &receiveBufferBytes) {
+        Darwin.setsockopt(
+          descriptor,
+          SOL_SOCKET,
+          SO_RCVBUF,
+          $0,
+          socklen_t(MemoryLayout<Int32>.size)
+        )
+      }
+      var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
+      _ = withUnsafePointer(to: &timeout) {
+        Darwin.setsockopt(
+          descriptor,
+          SOL_SOCKET,
+          SO_RCVTIMEO,
+          $0,
+          socklen_t(MemoryLayout<timeval>.size)
+        )
+      }
+
+      var localAddress = sockaddr_in()
+      localAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      localAddress.sin_family = sa_family_t(AF_INET)
+      localAddress.sin_port = 0
+      localAddress.sin_addr = in_addr(s_addr: INADDR_ANY)
+      let bindResult = withUnsafePointer(to: &localAddress) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Darwin.bind(
+            descriptor,
+            $0,
+            socklen_t(MemoryLayout<sockaddr_in>.size)
+          )
+        }
+      }
+      guard bindResult == 0 else {
+        reject("benchmark.udp_failed", "Could not bind the UDP socket", nil)
+        return
+      }
+
+      var boundAddress = sockaddr_in()
+      var boundAddressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+      let addressResult = withUnsafeMutablePointer(to: &boundAddress) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Darwin.getsockname(descriptor, $0, &boundAddressLength)
+        }
+      }
+      guard addressResult == 0 else {
+        reject("benchmark.udp_failed", "Could not read the UDP port", nil)
+        return
+      }
+      let localPort = Int(UInt16(bigEndian: boundAddress.sin_port))
+      guard
+        var components = URLComponents(string: urlString)
+      else {
+        reject("benchmark.invalid_request", "Invalid UDP benchmark URL", nil)
+        return
+      }
+      var queryItems = components.queryItems ?? []
+      queryItems.append(URLQueryItem(name: "port", value: String(localPort)))
+      components.queryItems = queryItems
+      guard let startURL = components.url else {
+        reject("benchmark.invalid_request", "Invalid UDP benchmark URL", nil)
+        return
+      }
+
+      var request = URLRequest(url: startURL)
+      request.httpMethod = "GET"
+      request.timeoutInterval = 15
+      request.cachePolicy = .reloadIgnoringLocalCacheData
+      request.setValue(token, forHTTPHeaderField: "X-NearNest-Transfer-Token")
+      let semaphore = DispatchSemaphore(value: 0)
+      var responseData: Data?
+      var responseStatus = 0
+      var responseError: Error?
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.timeoutIntervalForRequest = 15
+      configuration.timeoutIntervalForResource = 15
+      URLSession(configuration: configuration)
+        .dataTask(with: request) { data, response, error in
+          responseData = data
+          responseStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
+          responseError = error
+          semaphore.signal()
+        }
+        .resume()
+      guard semaphore.wait(timeout: .now() + 16) == .success,
+            responseError == nil,
+            responseStatus == 202,
+            let responseData,
+            let json = try? JSONSerialization.jsonObject(with: responseData)
+              as? [String: Any],
+            let sessionNumber = json["session"] as? NSNumber,
+            let packetNumber = json["packets"] as? NSNumber,
+            let byteNumber = json["bytes"] as? NSNumber
+      else {
+        reject(
+          "benchmark.udp_failed",
+          responseError?.localizedDescription ??
+            "Wearable did not start the UDP benchmark",
+          responseError
+        )
+        return
+      }
+
+      let session = sessionNumber.uint32Value
+      let packetsExpected = packetNumber.intValue
+      guard packetsExpected > 0,
+            byteNumber.int64Value == Int64(expectedBytes)
+      else {
+        reject(
+          "benchmark.udp_failed",
+          "Wearable returned an invalid UDP benchmark configuration",
+          nil
+        )
+        return
+      }
+
+      func readUInt16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
+        (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+      }
+      func readUInt32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        (UInt32(bytes[offset]) << 24) |
+          (UInt32(bytes[offset + 1]) << 16) |
+          (UInt32(bytes[offset + 2]) << 8) |
+          UInt32(bytes[offset + 3])
+      }
+
+      var seen = [Bool](repeating: false, count: packetsExpected)
+      var buffer = [UInt8](repeating: 0, count: 2048)
+      var packetsReceived = 0
+      var receivedBytes: Int64 = 0
+      var duplicates = 0
+      var outOfOrder = 0
+      var highestSequence = -1
+      var firstPacketAt: UInt64 = 0
+      var lastPacketAt: UInt64 = 0
+      var endReceivedAt: UInt64 = 0
+      let deadline =
+        DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+
+      while DispatchTime.now().uptimeNanoseconds < deadline {
+        let count = buffer.withUnsafeMutableBytes {
+          Darwin.recv(descriptor, $0.baseAddress, $0.count, 0)
+        }
+        if count < 0 {
+          if endReceivedAt > 0,
+             DispatchTime.now().uptimeNanoseconds - endReceivedAt >=
+               500_000_000 {
+            break
+          }
+          continue
+        }
+        guard count >= 16,
+              readUInt32(buffer, 0) == 0x4e4e5542,
+              readUInt32(buffer, 4) == session
+        else {
+          continue
+        }
+        let sequence = Int(readUInt32(buffer, 8))
+        let payloadBytes = Int(readUInt16(buffer, 12))
+        let flags = readUInt16(buffer, 14)
+        if flags & 1 != 0 {
+          if endReceivedAt == 0 {
+            endReceivedAt = DispatchTime.now().uptimeNanoseconds
+          }
+          continue
+        }
+        guard sequence >= 0, sequence < packetsExpected,
+              payloadBytes > 0, count >= 16 + payloadBytes
+        else {
+          continue
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if firstPacketAt == 0 { firstPacketAt = now }
+        lastPacketAt = now
+        if seen[sequence] {
+          duplicates += 1
+          continue
+        }
+        if sequence < highestSequence { outOfOrder += 1 }
+        highestSequence = max(highestSequence, sequence)
+        seen[sequence] = true
+        packetsReceived += 1
+        receivedBytes += Int64(payloadBytes)
+      }
+      guard firstPacketAt > 0, endReceivedAt > 0 else {
+        reject(
+          "benchmark.udp_failed",
+          "Wearable UDP benchmark did not complete",
+          nil
+        )
+        return
+      }
+      let elapsedMs = max(
+        1,
+        Int64(lastPacketAt - firstPacketAt) / 1_000_000
+      )
+      let lost = packetsExpected - packetsReceived
+      resolve([
+        "bytes": NSNumber(value: receivedBytes),
+        "elapsedMs": NSNumber(value: elapsedMs),
+        "bytesPerSecond": NSNumber(
+          value: Double(receivedBytes) * 1000.0 / Double(elapsedMs)
+        ),
+        "packetsExpected": NSNumber(value: packetsExpected),
+        "packetsReceived": NSNumber(value: packetsReceived),
+        "duplicates": NSNumber(value: duplicates),
+        "outOfOrder": NSNumber(value: outOfOrder),
+        "packetLossPercent": NSNumber(
+          value: Double(lost) * 100.0 / Double(packetsExpected)
+        ),
+      ])
+    }
   }
 
   @objc(uploadFile:url:path:resolver:rejecter:)

@@ -89,6 +89,53 @@ caches resumable 10 MiB ranges, leaves the hotspot, and uploads them through
 its normal internet connection, so an interrupted 500 MB sync continues from
 missing chunks instead of restarting the complete file.
 
+### Wearable transfer implementation and performance
+
+Android uses a hybrid UDP/TCP transfer over the private ESP hotspot:
+
+1. BLE discovers the wearable, lists finalized recordings, and returns
+   temporary hotspot credentials plus a transfer token.
+2. The phone joins the hotspot and requests each 10 MiB range from
+   `GET /v1/recording/udp`.
+3. UDP packets include a session ID, sequence number, payload length, and
+   CRC32. The phone writes in-order packets in 64 KiB batches.
+4. After the UDP range ends, the phone identifies missing or corrupt packet
+   runs and repairs only those byte ranges over
+   `GET /v1/recording`.
+5. The phone leaves the hotspot, restores internet access, uploads the cached
+   parts to the backend, completes the multipart upload, and only then sends
+   `recording.release`.
+
+iOS currently keeps the resumable TCP range path. BLE carries credentials and
+commands only; audio never travels over BLE.
+
+Physical testing on the current ESP32 and SPI-wired SD card produced:
+
+- UDP RAM/network capacity: approximately 2.3–2.6 MiB/s.
+- Original recording transfer: approximately 0.74 MiB/s.
+- Optimized recording transfer: approximately 1.2–1.39 MiB/s, with zero
+  missing or corrupt packets in the measured short runs.
+
+The optimized firmware uses aligned double buffering, separate SD and UDP
+tasks on the two ESP cores, direct FAT reads, ROM CRC32, watchdog-safe
+scheduling, and explicit task cleanup. The current SPI SD path cannot
+guarantee the 1.5 MiB/s product target. Reaching that target requires migrating
+the card to the ESP32 SDMMC host:
+
+| SD signal | ESP32 GPIO |
+| --- | --- |
+| CLK | 14 |
+| CMD | 15 |
+| DAT0 | 2 |
+| DAT1 | 4 |
+| DAT2 | 12 |
+| DAT3 | 13 |
+
+One-bit SDMMC uses CLK, CMD, and DAT0. Four-bit mode additionally uses DAT1,
+DAT2, and DAT3 and is preferred when the SD socket exposes every data line.
+CMD and all connected DAT lines require suitable pull-ups. The checked-in
+firmware still uses SPI until the hardware is rewired and SDMMC is enabled.
+
 The completion endpoint verifies the object before submitting a deterministic
 BullMQ ingestion job. Repeating the request does not create a second job. The
 ingestion worker probes the object over a short-lived read URL, so the backend

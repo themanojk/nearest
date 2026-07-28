@@ -1,0 +1,20 @@
+file(GLOB_RECURSE NIMBLE_SOURCES
+  "src/*.c"
+  "src/*.cpp"
+)
+file(GLOB_RECURSE NIMBLE_HEADERS
+  "src/*.h"
+)
+
+set(NIMBLE_INCLUDE_DIRS "src")
+foreach(NIMBLE_HEADER ${NIMBLE_HEADERS})
+  get_filename_component(NIMBLE_INCLUDE_DIR "${NIMBLE_HEADER}" DIRECTORY)
+  list(APPEND NIMBLE_INCLUDE_DIRS "${NIMBLE_INCLUDE_DIR}")
+endforeach()
+list(REMOVE_DUPLICATES NIMBLE_INCLUDE_DIRS)
+
+idf_component_register(
+  SRCS ${NIMBLE_SOURCES}
+  INCLUDE_DIRS ${NIMBLE_INCLUDE_DIRS}
+  REQUIRES arduino-esp32 bt nvs_flash
+)

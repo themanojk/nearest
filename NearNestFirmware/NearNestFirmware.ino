@@ -55,6 +55,7 @@ constexpr int kSdMisoPin = 19;
 constexpr int kSdMosiPin = 23;
 constexpr uint32_t kSdSpiFrequency = 4000000;
 constexpr uint32_t kSdTransferSpiFrequencies[] = {
+    80000000,
     40000000,
     20000000,
     10000000,
@@ -373,7 +374,7 @@ String formatUtcIso(int64_t utcMs) {
     return String();
   }
 
-  char buffer[32];
+  char buffer[80];
   snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
            utcTm.tm_year + 1900, utcTm.tm_mon + 1, utcTm.tm_mday, utcTm.tm_hour,
            utcTm.tm_min, utcTm.tm_sec, millisPart < 0 ? 0 : millisPart);
@@ -1303,6 +1304,9 @@ bool setupSdCard() {
   sdcard_type_t cardType = SD.cardType();
   const char *cardTypeLabel = "UNKNOWN";
   switch (cardType) {
+    case CARD_UNKNOWN:
+      cardTypeLabel = "UNKNOWN";
+      break;
     case CARD_MMC:
       cardTypeLabel = "MMC";
       break;
@@ -1333,7 +1337,7 @@ bool readSdProbe(const String &path,
   fingerprint = 2166136261UL;
   bytesRead = 0;
   elapsedMs = 0;
-  if (path.isEmpty()) return true;
+  if (path.isEmpty()) return false;
 
   File probe = SD.open(path.c_str(), FILE_READ);
   if (!probe) return false;
@@ -1355,6 +1359,31 @@ bool readSdProbe(const String &path,
   return bytesRead > 0;
 }
 
+String findSdTransferProbePath() {
+  File root = SD.open("/");
+  if (!root) return String();
+
+  String selectedPath;
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory() && entry.size() > 44) {
+      String name = entry.name();
+      String lowerName = name;
+      lowerName.toLowerCase();
+      if (!name.startsWith("._") && !name.startsWith("/._") &&
+          lowerName.endsWith(".wav")) {
+        selectedPath = name.startsWith("/") ? name : String("/") + name;
+        entry.close();
+        break;
+      }
+    }
+    entry.close();
+    entry = root.openNextFile();
+  }
+  root.close();
+  return selectedPath;
+}
+
 bool remountSdAtFrequency(uint32_t frequency) {
   SD.end();
   delay(20);
@@ -1368,14 +1397,34 @@ bool remountSdAtFrequency(uint32_t frequency) {
 bool enterTransferStorageMode(const String &probePath) {
   if (!gSdReady || !lockSd(pdMS_TO_TICKS(5000))) return false;
 
+  String effectiveProbePath = probePath;
   uint32_t safeFingerprint = 0;
   size_t safeProbeBytes = 0;
   uint32_t safeProbeElapsedMs = 0;
-  const bool haveProbe =
-      readSdProbe(
-          probePath, safeFingerprint, safeProbeBytes, safeProbeElapsedMs);
+  bool haveProbe = readSdProbe(
+      effectiveProbePath, safeFingerprint, safeProbeBytes, safeProbeElapsedMs);
+  if (!haveProbe) {
+    effectiveProbePath = findSdTransferProbePath();
+    haveProbe = readSdProbe(
+        effectiveProbePath,
+        safeFingerprint,
+        safeProbeBytes,
+        safeProbeElapsedMs);
+  }
+  if (haveProbe) {
+    Serial.printf(
+        "SD transfer probe selected: path=%s bytes=%u baseline_ms=%lu\n",
+        effectiveProbePath.c_str(),
+        static_cast<unsigned int>(safeProbeBytes),
+        static_cast<unsigned long>(safeProbeElapsedMs));
+  } else {
+    Serial.println(
+        "WARN: no WAV file available to verify high-speed SD transfer mode");
+  }
+
   bool mounted = false;
   for (const uint32_t frequency : kSdTransferSpiFrequencies) {
+    if (!haveProbe && frequency != kSdSpiFrequency) continue;
     if (!remountSdAtFrequency(frequency)) {
       Serial.printf("WARN: SD transfer mount failed at %lu Hz\n",
                     static_cast<unsigned long>(frequency));
@@ -1386,9 +1435,10 @@ bool enterTransferStorageMode(const String &probePath) {
     size_t candidateProbeBytes = 0;
     uint32_t candidateProbeElapsedMs = 0;
     const bool probeMatches =
-        !haveProbe ||
-        (readSdProbe(
-             probePath,
+        (!haveProbe && frequency == kSdSpiFrequency) ||
+        (haveProbe &&
+         readSdProbe(
+             effectiveProbePath,
              candidateFingerprint,
              candidateProbeBytes,
              candidateProbeElapsedMs) &&

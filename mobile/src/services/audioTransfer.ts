@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 import { authenticatedRequest } from './auth';
 import type {
   DeviceTransport,
@@ -363,6 +364,7 @@ export function startDirectWifiSync(
         await localTransfer.connect(access.ssid, access.password);
         hotspotConnected = true;
         callbacks.onNetworkBenchmarkState?.(true);
+        let tcpBenchmarkBytesPerSecond = 0;
         try {
           const benchmark = await localTransfer.benchmark(
             `${access.baseUrl}/v1/benchmark`,
@@ -375,12 +377,41 @@ export function startDirectWifiSync(
               (1024 * 1024)
             ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms)`,
           );
-          callbacks.onNetworkBenchmark?.(benchmark.bytesPerSecond);
+          tcpBenchmarkBytesPerSecond = benchmark.bytesPerSecond;
         } catch (error) {
           console.warn(
-            '[NearNest transfer] RAM benchmark unavailable',
+            '[NearNest transfer] TCP RAM benchmark unavailable',
             error,
           );
+        }
+        try {
+          const benchmark = await localTransfer.benchmarkUdp(
+            `${access.baseUrl}/v1/benchmark/udp`,
+            access.token,
+            NETWORK_BENCHMARK_BYTES,
+          );
+          console.info(
+            `[NearNest transfer] UDP RAM benchmark ${(
+              benchmark.bytesPerSecond /
+              (1024 * 1024)
+            ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms), ` +
+              `packets=${benchmark.packetsReceived}/${benchmark.packetsExpected}, ` +
+              `loss=${benchmark.packetLossPercent.toFixed(3)}%, ` +
+              `duplicates=${benchmark.duplicates}, ` +
+              `outOfOrder=${benchmark.outOfOrder}`,
+          );
+          callbacks.onNetworkBenchmark?.(
+            benchmark.bytesPerSecond,
+            benchmark.packetLossPercent,
+          );
+        } catch (error) {
+          console.warn(
+            '[NearNest transfer] UDP RAM benchmark unavailable',
+            error,
+          );
+          if (tcpBenchmarkBytesPerSecond > 0) {
+            callbacks.onNetworkBenchmark?.(tcpBenchmarkBytesPerSecond);
+          }
         } finally {
           callbacks.onNetworkBenchmarkState?.(false);
         }
@@ -390,13 +421,48 @@ export function startDirectWifiSync(
             `recordingId=${encodeURIComponent(
               part.pending.recording.recordingId,
             )}&offsetBytes=${part.offsetBytes}&lengthBytes=${part.lengthBytes}`;
-          part.path = await localTransfer.downloadRange(
-            part.cacheKey,
-            `${access.baseUrl}/v1/recording?${query}`,
-            access.token,
-            part.lengthBytes,
-            part.cacheKey,
-          );
+          const tcpUrl = `${access.baseUrl}/v1/recording?${query}`;
+          if (Platform.OS === 'android') {
+            try {
+              const hybrid = await localTransfer.downloadRangeHybridUdp(
+                part.cacheKey,
+                `${access.baseUrl}/v1/recording/udp?${query}`,
+                access.token,
+                part.lengthBytes,
+                part.cacheKey,
+              );
+              part.path = hybrid.path;
+              console.info(
+                `[NearNest transfer] UDP recording part ${(
+                  hybrid.udpBytesPerSecond /
+                  (1024 * 1024)
+                ).toFixed(2)} MB/s, loss=${hybrid.packetLossPercent.toFixed(
+                  3,
+                )}%, missing=${hybrid.missingPackets}, ` +
+                  `TCP repair=${hybrid.repairedBytes} bytes`,
+              );
+            } catch (error) {
+              console.warn(
+                '[NearNest transfer] UDP recording part failed; falling back to TCP',
+                error,
+              );
+              part.path = await localTransfer.downloadRange(
+                part.cacheKey,
+                tcpUrl,
+                access.token,
+                part.lengthBytes,
+                part.cacheKey,
+              );
+            }
+          } else {
+            part.path = await localTransfer.downloadRange(
+              part.cacheKey,
+              tcpUrl,
+              access.token,
+              part.lengthBytes,
+              part.cacheKey,
+            );
+          }
           transferredBytes.set(part.cacheKey, part.lengthBytes);
           reportTransferProgress();
         }

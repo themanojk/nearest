@@ -17,6 +17,16 @@ jest.mock('./localTransfer', () => ({
       bytesPerSecond: 2 * 1024 * 1024,
       elapsedMs: 8_000,
     }),
+    benchmarkUdp: jest.fn().mockResolvedValue({
+      bytes: 16 * 1024 * 1024,
+      bytesPerSecond: 3 * 1024 * 1024,
+      duplicates: 0,
+      elapsedMs: 5_333,
+      outOfOrder: 0,
+      packetLossPercent: 0,
+      packetsExpected: 12_123,
+      packetsReceived: 12_123,
+    }),
     cancelAll: jest.fn().mockResolvedValue(undefined),
     connect: jest.fn().mockResolvedValue(undefined),
     deleteCachedPart: jest.fn().mockResolvedValue(true),
@@ -29,6 +39,21 @@ jest.mock('./localTransfer', () => ({
         _expectedBytes: number,
         cacheKey: string,
       ) => `/cache/${cacheKey}.part`,
+    ),
+    downloadRangeHybridUdp: jest.fn(
+      async (
+        _jobId: string,
+        _url: string,
+        _token: string,
+        expectedBytes: number,
+        cacheKey: string,
+      ) => ({
+        missingPackets: 0,
+        packetLossPercent: 0,
+        path: `/cache/${cacheKey}.part`,
+        repairedBytes: 0,
+        udpBytesPerSecond: expectedBytes,
+      }),
     ),
     getAvailableCacheBytes: jest
       .fn()

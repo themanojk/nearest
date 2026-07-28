@@ -28,7 +28,10 @@ import { startDirectWifiSync } from './audioTransfer';
 
 export type SyncCallbacks = {
   onFileProgress: (completedFiles: number, totalFiles: number) => void;
-  onNetworkBenchmark?: (bytesPerSecond: number) => void;
+  onNetworkBenchmark?: (
+    bytesPerSecond: number,
+    packetLossPercent?: number,
+  ) => void;
   onNetworkBenchmarkState?: (running: boolean) => void;
   onTransfer: (progress: number) => void; // 0..1
   onTransferTelemetry?: (telemetry: {
@@ -59,6 +62,12 @@ export type DeviceRecordingManifest = {
   recordingId: string;
   sizeBytes: number;
 };
+
+// Arduino String::compareTo() orders the UTF-8 bytes. Do not use
+// localeCompare() for the recording cursor: locale collation can reorder
+// punctuation and case and make a valid firmware catalog appear non-monotonic.
+export const compareFirmwareStrings = (left: string, right: string): number =>
+  Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
 
 export type LocalTransferAccess = {
   baseUrl: string;
@@ -429,8 +438,10 @@ export class BleWifiTransport implements DeviceTransport {
       );
       if (status.event === 'recording.list_complete') break;
       const recording = this.recordingFromStatus(status);
-      if (recording.fileName.localeCompare(afterFileName) <= 0) {
-        throw new Error('Wearable returned an invalid recording catalog item');
+      if (compareFirmwareStrings(recording.fileName, afterFileName) <= 0) {
+        throw new Error(
+          `Wearable returned a repeated or out-of-order recording catalog item: ${recording.fileName}`,
+        );
       }
       recordings.push(recording);
       onCatalogProgress?.(recordings.length);

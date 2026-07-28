@@ -1,0 +1,20 @@
+get_filename_component(
+  NEARNEST_ARDUINO_SOURCE
+  "${CMAKE_CURRENT_LIST_DIR}/../../NearNestFirmware"
+  ABSOLUTE
+)
+
+idf_component_register(
+  SRCS
+    "main.cpp"
+    "${NEARNEST_ARDUINO_SOURCE}/NearNestConnectivity.cpp"
+  INCLUDE_DIRS
+    "."
+    "${NEARNEST_ARDUINO_SOURCE}"
+  REQUIRES
+    arduino-esp32
+    arduinojson
+    crypto_arduino
+    nimble_arduino
+    tinygpsplus
+)

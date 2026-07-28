@@ -100,6 +100,7 @@ export default function SyncFlow() {
         transferBytes: 0,
         transferTotalBytes: 0,
         networkBenchmarkBytesPerSecond: 0,
+        networkBenchmarkPacketLossPercent: null,
         networkBenchmarkRunning: false,
         uploadProgress: 0,
         uploadedFileCount: 0,
@@ -109,8 +110,12 @@ export default function SyncFlow() {
       handleRef.current = transport.startSync({
         onFileProgress: (completedFiles, totalFiles) =>
           patch({ uploadedFileCount: completedFiles, totalFileCount: totalFiles }),
-        onNetworkBenchmark: (bytesPerSecond) =>
-          patch({ networkBenchmarkBytesPerSecond: bytesPerSecond }),
+        onNetworkBenchmark: (bytesPerSecond, packetLossPercent) =>
+          patch({
+            networkBenchmarkBytesPerSecond: bytesPerSecond,
+            networkBenchmarkPacketLossPercent:
+              packetLossPercent ?? null,
+          }),
         onNetworkBenchmarkState: (running) =>
           patch({ networkBenchmarkRunning: running }),
         onTransfer: (p) =>
@@ -223,13 +228,16 @@ export default function SyncFlow() {
             <ProgressBar value={state.transferProgress} />
             {state.networkBenchmarkRunning && (
               <Txt size={12} color={colors.muted}>
-                Measuring network-only speed…
+                Measuring TCP and UDP network speed…
               </Txt>
             )}
             {state.networkBenchmarkBytesPerSecond > 0 && (
               <Txt size={12} color={colors.muted}>
-                Network-only test:{' '}
+                Network-only result:{' '}
                 {formatTransferRate(state.networkBenchmarkBytesPerSecond)}
+                {state.networkBenchmarkPacketLossPercent !== null
+                  ? ` · UDP loss ${state.networkBenchmarkPacketLossPercent.toFixed(3)}%`
+                  : ''}
               </Txt>
             )}
             <StageChip
@@ -357,6 +365,7 @@ export default function SyncFlow() {
                   transferBytes: 0,
                   transferTotalBytes: 0,
                   networkBenchmarkBytesPerSecond: 0,
+                  networkBenchmarkPacketLossPercent: null,
                   networkBenchmarkRunning: false,
                   uploadProgress: 0,
                   uploadedFileCount: 0,

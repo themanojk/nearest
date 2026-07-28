@@ -51,6 +51,8 @@ class NearNestConnectivity {
   void startTransferAccessPoint();
   void stopTransferAccessPoint(bool notify = true);
   void serveNetworkBenchmark();
+  void startUdpNetworkBenchmark();
+  void startUdpRecordingTransfer();
   void serveRecordingRange();
   void signChallenge(const String &payload);
   void configureWifi(const String &ssid, const String &password);

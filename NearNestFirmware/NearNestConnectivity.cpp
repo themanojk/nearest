@@ -8,10 +8,16 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <esp_rom_crc.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include <lwip/sockets.h>
 #include <mbedtls/base64.h>
 #include <freertos/queue.h>
 #include <memory>
+#include <unistd.h>
 
 #include "NearNestBuildConfig.h"
 #include "device_secrets.h"
@@ -26,11 +32,33 @@ constexpr size_t kMaxCommandBytes = 4096;
 constexpr uint32_t kMaximumTransferRangeBytes = 10 * 1024 * 1024;
 constexpr uint32_t kNetworkBenchmarkBytes = 16 * 1024 * 1024;
 constexpr size_t kNetworkBenchmarkBufferBytes = 16 * 1024;
+constexpr size_t kUdpBenchmarkDatagramBytes = 1400;
+constexpr size_t kUdpBenchmarkHeaderBytes = 16;
+constexpr size_t kUdpBenchmarkPayloadBytes =
+    kUdpBenchmarkDatagramBytes - kUdpBenchmarkHeaderBytes;
+constexpr uint32_t kUdpBenchmarkMagic = 0x4e4e5542;  // "NNUB"
+constexpr uint16_t kUdpBenchmarkEndFlag = 1;
+// A 1,408-byte payload plus the 20-byte application header remains below the
+// 1,500-byte Wi-Fi MTU. Eight payloads are exactly 22 SD sectors, keeping the
+// double-buffer pipeline aligned without consuming Wi-Fi's working heap.
+constexpr size_t kUdpRecordingDatagramBytes = 1428;
+constexpr size_t kUdpRecordingHeaderBytes = 20;
+constexpr size_t kUdpRecordingPayloadBytes =
+    kUdpRecordingDatagramBytes - kUdpRecordingHeaderBytes;
+constexpr size_t kUdpRecordingPipelineBlockCount = 2;
+constexpr size_t kUdpRecordingReadBufferBytes =
+    kUdpRecordingPayloadBytes * 8;
+constexpr size_t kUdpRecordingPipelineBufferBytes =
+    kUdpRecordingPipelineBlockCount * kUdpRecordingReadBufferBytes;
+constexpr uint32_t kUdpRecordingMagic = 0x4e4e5552;  // "NNUR"
 constexpr uint32_t kTransferApIdleTimeoutMs = 10 * 60 * 1000;
-// ESP32's default TCP send window is much smaller than 32 KB. Feeding it in
-// window-sized blocks preserves throughput while leaving heap available for
-// Wi-Fi pbufs and retransmissions.
-constexpr size_t kTransferBufferBytes = 32 * 1024;
+// Two 12 KB blocks are the best measured balance on this hardware: 16 KB
+// blocks starved Wi-Fi pbufs, while 8 KB blocks increased SD and scheduling
+// overhead. Keep the 24 KB pipeline on CPU 1.
+constexpr size_t kTransferPipelineBlockBytes = 12 * 1024;
+constexpr size_t kTransferPipelineBlockCount = 2;
+constexpr size_t kTransferBufferBytes =
+    kTransferPipelineBlockCount * kTransferPipelineBlockBytes;
 constexpr uint32_t kBleHandoffDelayMs = 750;
 constexpr char kTransferTokenHeader[] = "X-NearNest-Transfer-Token";
 constexpr char kTransferBaseUrl[] = "http://192.168.4.1";
@@ -50,6 +78,460 @@ uint32_t gTransferLastActivityMs = 0;
 uint8_t gTransferApChannel = 1;
 uint16_t gBleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
 uint32_t gBleDisconnectAtMs = 0;
+volatile bool gUdpBenchmarkRunning = false;
+volatile bool gUdpRecordingTransferRunning = false;
+
+struct UdpBenchmarkContext {
+  IPAddress address;
+  uint16_t port;
+  uint32_t session;
+};
+
+struct UdpRecordingContext {
+  fs::FS *storage;
+  SemaphoreHandle_t storageMutex;
+  IPAddress address;
+  String path;
+  uint64_t offsetBytes;
+  uint32_t lengthBytes;
+  uint16_t port;
+  uint32_t session;
+};
+
+void writeBigEndian16(uint8_t *destination, uint16_t value) {
+  destination[0] = static_cast<uint8_t>(value >> 8);
+  destination[1] = static_cast<uint8_t>(value);
+}
+
+void writeBigEndian32(uint8_t *destination, uint32_t value) {
+  destination[0] = static_cast<uint8_t>(value >> 24);
+  destination[1] = static_cast<uint8_t>(value >> 16);
+  destination[2] = static_cast<uint8_t>(value >> 8);
+  destination[3] = static_cast<uint8_t>(value);
+}
+
+uint32_t crc32(const uint8_t *data, size_t length) {
+  return esp_rom_crc32_le(
+      0, data, static_cast<uint32_t>(length));
+}
+
+struct UdpRecordingReadyBlock {
+  uint8_t index;
+  uint16_t bytes;
+};
+
+struct UdpRecordingReadContext {
+  int fileDescriptor;
+  uint8_t *buffer;
+  QueueHandle_t freeBlocks;
+  QueueHandle_t readyBlocks;
+  SemaphoreHandle_t finished;
+  uint32_t remainingBytes;
+  volatile uint32_t sdReadElapsedMs;
+  volatile bool cancelled;
+  volatile bool producerDone;
+  volatile bool readFailed;
+};
+
+void udpRecordingSdReaderTask(void *parameter) {
+  auto *context = static_cast<UdpRecordingReadContext *>(parameter);
+  while (context->remainingBytes > 0 && !context->cancelled) {
+    uint8_t blockIndex = 0;
+    while (!context->cancelled &&
+           xQueueReceive(
+               context->freeBlocks, &blockIndex,
+               pdMS_TO_TICKS(50)) != pdTRUE) {
+    }
+    if (context->cancelled) break;
+
+    const size_t wanted = min(
+        static_cast<size_t>(context->remainingBytes),
+        kUdpRecordingReadBufferBytes);
+    uint8_t *block =
+        context->buffer +
+        static_cast<size_t>(blockIndex) * kUdpRecordingReadBufferBytes;
+    size_t bytesRead = 0;
+    const uint32_t readStartedAtMs = millis();
+    while (bytesRead < wanted && !context->cancelled) {
+      const ssize_t count = ::read(
+          context->fileDescriptor, block + bytesRead,
+          wanted - bytesRead);
+      if (count <= 0) break;
+      bytesRead += static_cast<size_t>(count);
+    }
+    context->sdReadElapsedMs += millis() - readStartedAtMs;
+    if (bytesRead != wanted) {
+      context->readFailed = true;
+      break;
+    }
+
+    const UdpRecordingReadyBlock readyBlock = {
+        .index = blockIndex,
+        .bytes = static_cast<uint16_t>(bytesRead),
+    };
+    while (!context->cancelled &&
+           xQueueSend(
+               context->readyBlocks, &readyBlock,
+               pdMS_TO_TICKS(50)) != pdTRUE) {
+    }
+    if (context->cancelled) break;
+    context->remainingBytes -= static_cast<uint32_t>(bytesRead);
+  }
+
+  context->producerDone = true;
+  xSemaphoreGive(context->finished);
+  vTaskDelete(nullptr);
+}
+
+void udpRecordingTask(void *parameter) {
+  std::unique_ptr<UdpRecordingContext> context(
+      static_cast<UdpRecordingContext *>(parameter));
+  delay(150);
+
+  bool storageLocked = false;
+  int fileDescriptor = -1;
+  int udpSocket = -1;
+  std::unique_ptr<uint8_t[]> readBuffer(
+      new uint8_t[kUdpRecordingPipelineBufferBytes]);
+  QueueHandle_t freeBlocks = nullptr;
+  QueueHandle_t readyBlocks = nullptr;
+  SemaphoreHandle_t readerFinished = nullptr;
+  TaskHandle_t readerTask = nullptr;
+  uint8_t packet[kUdpRecordingDatagramBytes] = {};
+  uint32_t sequence = 0;
+  uint32_t remaining = context->lengthBytes;
+  uint32_t sentBytes = 0;
+  uint32_t failedDatagrams = 0;
+  uint32_t consumerWaitElapsedMs = 0;
+  bool succeeded = false;
+  const uint32_t startedAtMs = millis();
+
+  if (readBuffer &&
+      (!context->storageMutex ||
+       (storageLocked =
+            xSemaphoreTake(
+                context->storageMutex, pdMS_TO_TICKS(5000)) == pdTRUE))) {
+    char vfsPath[256] = {};
+    snprintf(
+        vfsPath, sizeof(vfsPath), "/sd%s", context->path.c_str());
+    fileDescriptor = ::open(vfsPath, O_RDONLY);
+    if (fileDescriptor >= 0 &&
+        ::lseek(
+            fileDescriptor, static_cast<off_t>(context->offsetBytes),
+            SEEK_SET) >= 0) {
+      udpSocket = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      freeBlocks = xQueueCreate(
+          kUdpRecordingPipelineBlockCount, sizeof(uint8_t));
+      readyBlocks = xQueueCreate(
+          kUdpRecordingPipelineBlockCount,
+          sizeof(UdpRecordingReadyBlock));
+      readerFinished = xSemaphoreCreateBinary();
+    }
+  }
+
+  UdpRecordingReadContext readContext = {
+      .fileDescriptor = fileDescriptor,
+      .buffer = readBuffer.get(),
+      .freeBlocks = freeBlocks,
+      .readyBlocks = readyBlocks,
+      .finished = readerFinished,
+      .remainingBytes = context->lengthBytes,
+      .sdReadElapsedMs = 0,
+      .cancelled = false,
+      .producerDone = false,
+      .readFailed = false,
+  };
+  if (udpSocket >= 0 && freeBlocks && readyBlocks && readerFinished) {
+    for (uint8_t blockIndex = 0;
+         blockIndex < kUdpRecordingPipelineBlockCount; ++blockIndex) {
+      xQueueSend(freeBlocks, &blockIndex, 0);
+    }
+    if (xTaskCreatePinnedToCore(
+            udpRecordingSdReaderTask, "udp-sd-reader", 3072,
+            &readContext, 3, &readerTask, 1) != pdPASS) {
+      readerTask = nullptr;
+    }
+  }
+
+  sockaddr_in destination = {};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(context->port);
+  destination.sin_addr.s_addr =
+      static_cast<uint32_t>(context->address);
+  writeBigEndian32(packet, kUdpRecordingMagic);
+  writeBigEndian32(packet + 4, context->session);
+
+  while (udpSocket >= 0 && readerTask && remaining > 0 &&
+         gTransferApActive &&
+         millis() - startedAtMs < 120000) {
+    UdpRecordingReadyBlock readyBlock {};
+    const uint32_t waitStartedAtMs = millis();
+    const BaseType_t received = xQueueReceive(
+        readyBlocks, &readyBlock, pdMS_TO_TICKS(1000));
+    consumerWaitElapsedMs += millis() - waitStartedAtMs;
+    if (received != pdTRUE) {
+      if (readContext.producerDone) break;
+      continue;
+    }
+
+    uint8_t *block =
+        readBuffer.get() +
+        static_cast<size_t>(readyBlock.index) *
+            kUdpRecordingReadBufferBytes;
+    size_t blockOffset = 0;
+    while (blockOffset < readyBlock.bytes && gTransferApActive) {
+      const uint16_t payloadBytes = static_cast<uint16_t>(
+          min(
+              kUdpRecordingPayloadBytes,
+              static_cast<size_t>(readyBlock.bytes) - blockOffset));
+      memcpy(
+          packet + kUdpRecordingHeaderBytes,
+          block + blockOffset,
+          payloadBytes);
+      writeBigEndian32(packet + 8, sequence);
+      writeBigEndian16(packet + 12, payloadBytes);
+      writeBigEndian16(packet + 14, 0);
+      writeBigEndian32(
+          packet + 16,
+          crc32(packet + kUdpRecordingHeaderBytes, payloadBytes));
+      const size_t datagramBytes =
+          kUdpRecordingHeaderBytes + payloadBytes;
+      const ssize_t written = lwip_sendto(
+          udpSocket, packet, datagramBytes, 0,
+          reinterpret_cast<const sockaddr *>(&destination),
+          sizeof(destination));
+      if (written != static_cast<ssize_t>(datagramBytes)) {
+        ++failedDatagrams;
+        delay(1);
+        continue;
+      }
+      blockOffset += payloadBytes;
+      remaining -= payloadBytes;
+      sentBytes += payloadBytes;
+      ++sequence;
+      // taskYIELD() only offers the core to another ready task at the same
+      // priority. Block briefly so the idle task can service the watchdog
+      // during sustained multi-megabyte transfers.
+      if ((sequence & 255U) == 0) vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    xQueueSend(freeBlocks, &readyBlock.index, 0);
+  }
+
+  if (readerTask) {
+    readContext.cancelled = true;
+    xSemaphoreTake(readerFinished, portMAX_DELAY);
+  }
+
+  if (udpSocket >= 0) {
+    writeBigEndian32(packet + 8, sequence);
+    writeBigEndian16(packet + 12, 0);
+    writeBigEndian16(packet + 14, kUdpBenchmarkEndFlag);
+    writeBigEndian32(packet + 16, 0);
+    for (uint8_t repeat = 0; repeat < 8 && gTransferApActive; ++repeat) {
+      lwip_sendto(
+          udpSocket, packet, kUdpRecordingHeaderBytes, 0,
+          reinterpret_cast<const sockaddr *>(&destination),
+          sizeof(destination));
+      delay(2);
+    }
+    lwip_close(udpSocket);
+  }
+  if (fileDescriptor >= 0) ::close(fileDescriptor);
+  if (storageLocked) xSemaphoreGive(context->storageMutex);
+  succeeded = remaining == 0;
+
+  const uint32_t elapsedMs =
+      max(static_cast<uint32_t>(1), millis() - startedAtMs);
+  Serial.printf(
+      "UDP recording range: offset=%llu bytes=%lu datagrams=%lu "
+      "elapsed_ms=%lu sd_read_ms=%lu consumer_wait_ms=%lu "
+      "speed_kib_s=%lu failed_datagrams=%lu "
+      "free_heap=%lu min_free_heap=%lu result=%s\n",
+      static_cast<unsigned long long>(context->offsetBytes),
+      static_cast<unsigned long>(sentBytes),
+      static_cast<unsigned long>(sequence),
+      static_cast<unsigned long>(elapsedMs),
+      static_cast<unsigned long>(readContext.sdReadElapsedMs),
+      static_cast<unsigned long>(consumerWaitElapsedMs),
+      static_cast<unsigned long>(
+          static_cast<uint64_t>(sentBytes) * 1000ULL / elapsedMs / 1024ULL),
+      static_cast<unsigned long>(failedDatagrams),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      succeeded ? "complete" : "interrupted");
+  gTransferLastActivityMs = millis();
+  gUdpRecordingTransferRunning = false;
+  if (freeBlocks) vQueueDelete(freeBlocks);
+  if (readyBlocks) vQueueDelete(readyBlocks);
+  if (readerFinished) vSemaphoreDelete(readerFinished);
+  readBuffer.reset();
+  context.reset();
+  vTaskDelete(nullptr);
+}
+
+void udpBenchmarkTask(void *parameter) {
+  std::unique_ptr<UdpBenchmarkContext> context(
+      static_cast<UdpBenchmarkContext *>(parameter));
+  delay(150);
+
+  const int udpSocket = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (udpSocket < 0) {
+    Serial.printf(
+        "UDP RAM benchmark sender: socket_failed errno=%d\n", errno);
+    gUdpBenchmarkRunning = false;
+    context.reset();
+    vTaskDelete(nullptr);
+    return;
+  }
+  sockaddr_in destination = {};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(context->port);
+  destination.sin_addr.s_addr =
+      static_cast<uint32_t>(context->address);
+  uint8_t packet[kUdpBenchmarkDatagramBytes] = {};
+  writeBigEndian32(packet, kUdpBenchmarkMagic);
+  writeBigEndian32(packet + 4, context->session);
+  for (size_t index = kUdpBenchmarkHeaderBytes;
+       index < sizeof(packet); ++index) {
+    packet[index] = static_cast<uint8_t>((index * 31U + 17U) & 0xffU);
+  }
+
+  uint32_t sequence = 0;
+  uint32_t remaining = kNetworkBenchmarkBytes;
+  uint32_t sentBytes = 0;
+  uint32_t failedDatagrams = 0;
+  const uint32_t startedAtMs = millis();
+  while (remaining > 0 && gTransferApActive &&
+         millis() - startedAtMs < 60000) {
+    const uint16_t payloadBytes = static_cast<uint16_t>(
+        min(static_cast<uint32_t>(kUdpBenchmarkPayloadBytes), remaining));
+    writeBigEndian32(packet + 8, sequence);
+    writeBigEndian16(packet + 12, payloadBytes);
+    writeBigEndian16(packet + 14, 0);
+    const size_t datagramBytes =
+        kUdpBenchmarkHeaderBytes + payloadBytes;
+    const ssize_t written = lwip_sendto(
+        udpSocket, packet, datagramBytes, 0,
+        reinterpret_cast<const sockaddr *>(&destination),
+        sizeof(destination));
+    const bool sent = written == static_cast<ssize_t>(datagramBytes);
+    if (sent) {
+      remaining -= payloadBytes;
+      sentBytes += payloadBytes;
+      ++sequence;
+    } else {
+      ++failedDatagrams;
+      delay(1);
+    }
+    if ((sequence & 15U) == 0) vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  writeBigEndian32(packet + 8, sequence);
+  writeBigEndian16(packet + 12, 0);
+  writeBigEndian16(packet + 14, kUdpBenchmarkEndFlag);
+  for (uint8_t repeat = 0; repeat < 8 && gTransferApActive; ++repeat) {
+    lwip_sendto(
+        udpSocket, packet, kUdpBenchmarkHeaderBytes, 0,
+        reinterpret_cast<const sockaddr *>(&destination),
+        sizeof(destination));
+    delay(2);
+  }
+  lwip_close(udpSocket);
+
+  const uint32_t elapsedMs =
+      max(static_cast<uint32_t>(1), millis() - startedAtMs);
+  const uint32_t kibPerSecond = static_cast<uint32_t>(
+      static_cast<uint64_t>(sentBytes) * 1000ULL / elapsedMs / 1024ULL);
+  Serial.printf(
+      "UDP RAM benchmark sender: bytes=%lu datagrams=%lu elapsed_ms=%lu "
+      "speed_kib_s=%lu failed_datagrams=%lu channel=%u free_heap=%lu "
+      "min_free_heap=%lu result=%s\n",
+      static_cast<unsigned long>(sentBytes),
+      static_cast<unsigned long>(sequence),
+      static_cast<unsigned long>(elapsedMs),
+      static_cast<unsigned long>(kibPerSecond),
+      static_cast<unsigned long>(failedDatagrams),
+      static_cast<unsigned int>(gTransferApChannel),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      remaining == 0 ? "complete" : "interrupted");
+  gTransferLastActivityMs = millis();
+  gUdpBenchmarkRunning = false;
+  context.reset();
+  vTaskDelete(nullptr);
+}
+
+struct TransferReadyBlock {
+  uint8_t index;
+  uint16_t bytes;
+};
+
+struct TransferReadContext {
+  File *file;
+  uint8_t *buffer;
+  QueueHandle_t freeBlocks;
+  QueueHandle_t readyBlocks;
+  SemaphoreHandle_t finished;
+  uint32_t remainingBytes;
+  volatile uint32_t sdReadElapsedMs;
+  uint32_t freeBlockWaitElapsedMs;
+  uint32_t blocksRead;
+  volatile bool cancelled;
+  volatile bool producerDone;
+  volatile bool readFailed;
+};
+
+void transferSdReaderTask(void *parameter) {
+  auto *context = static_cast<TransferReadContext *>(parameter);
+  while (context->remainingBytes > 0 && !context->cancelled) {
+    uint8_t blockIndex = 0;
+    const uint32_t freeBlockWaitStartedAtMs = millis();
+    while (!context->cancelled &&
+           xQueueReceive(
+               context->freeBlocks, &blockIndex, pdMS_TO_TICKS(50)) !=
+               pdTRUE) {
+    }
+    context->freeBlockWaitElapsedMs +=
+        millis() - freeBlockWaitStartedAtMs;
+    if (context->cancelled) break;
+
+    const size_t wanted =
+        min(
+            static_cast<size_t>(context->remainingBytes),
+            kTransferPipelineBlockBytes);
+    const uint32_t readStartedAtMs = millis();
+    const size_t bytesRead = context->file->read(
+        context->buffer +
+            static_cast<size_t>(blockIndex) * kTransferPipelineBlockBytes,
+        wanted);
+    context->sdReadElapsedMs += millis() - readStartedAtMs;
+    if (bytesRead == 0) {
+      context->readFailed = true;
+      break;
+    }
+
+    const TransferReadyBlock readyBlock = {
+        .index = blockIndex,
+        .bytes = static_cast<uint16_t>(bytesRead),
+    };
+    bool queued = false;
+    while (!context->cancelled) {
+      if (xQueueSend(
+              context->readyBlocks, &readyBlock, pdMS_TO_TICKS(50)) ==
+          pdTRUE) {
+        queued = true;
+        break;
+      }
+    }
+    if (!queued) break;
+    context->remainingBytes -= static_cast<uint32_t>(bytesRead);
+    ++context->blocksRead;
+  }
+
+  context->producerDone = true;
+  xSemaphoreGive(context->finished);
+  vTaskDelete(nullptr);
+}
 
 int readBatteryPercent() {
 #if NEARNEST_BATTERY_ADC_PIN >= 0
@@ -141,6 +623,20 @@ bool isWaveFileName(const String &fileName) {
   lower.toLowerCase();
   return !fileName.isEmpty() && !fileName.startsWith("._") &&
          lower.endsWith(".wav");
+}
+
+bool hasWaveHeader(File &file) {
+  if (!file || file.isDirectory() || file.size() <= 44) return false;
+
+  const size_t originalPosition = file.position();
+  uint8_t header[12] = {};
+  const bool readHeader =
+      file.seek(0) && file.read(header, sizeof(header)) == sizeof(header);
+  file.seek(originalPosition);
+
+  return readHeader && header[0] == 'R' && header[1] == 'I' &&
+         header[2] == 'F' && header[3] == 'F' && header[8] == 'W' &&
+         header[9] == 'A' && header[10] == 'V' && header[11] == 'E';
 }
 
 String recordingIdForFileName(const String &fileName) {
@@ -585,7 +1081,7 @@ void NearNestConnectivity::publishNextRecording(const String &afterFileName) {
     while (entry) {
       if (!entry.isDirectory()) {
         const String fileName = recordingFileName(String(entry.name()));
-        if (isWaveFileName(fileName) && entry.size() > 44 &&
+        if (isWaveFileName(fileName) && hasWaveHeader(entry) &&
             fileName.compareTo(afterFileName) > 0 &&
             (selectedFileName.isEmpty() ||
              fileName.compareTo(selectedFileName) < 0)) {
@@ -635,9 +1131,10 @@ bool NearNestConnectivity::resolveRecording(const String &recordingId,
     return false;
   }
   sizeBytes = static_cast<uint64_t>(file.size());
+  const bool validWave = hasWaveHeader(file);
   file.close();
   if (storageMutex_) xSemaphoreGive(storageMutex_);
-  return sizeBytes > 0;
+  return validWave;
 }
 
 void NearNestConnectivity::signChallenge(const String &payload) {
@@ -738,6 +1235,37 @@ void NearNestConnectivity::startTransferAccessPoint() {
     return;
   }
 
+  // HT40 was slower in real phone tests because the wider 2.4 GHz channel
+  // collected substantially more interference. Keep the AP on HT20; it
+  // delivered the higher and more stable RAM benchmark on this hardware.
+  const wifi_second_chan_t requestedSecondaryChannel =
+      WIFI_SECOND_CHAN_NONE;
+  const bool bandwidthConfigured = WiFi.softAPbandwidth(WIFI_BW_HT20);
+  const int channelConfigured =
+      WiFi.setChannel(gTransferApChannel, requestedSecondaryChannel);
+  wifi_bandwidth_t actualBandwidth = WIFI_BW_HT20;
+  uint8_t actualPrimaryChannel = 0;
+  wifi_second_chan_t actualSecondaryChannel = WIFI_SECOND_CHAN_NONE;
+  const esp_err_t bandwidthReadResult =
+      esp_wifi_get_bandwidth(WIFI_IF_AP, &actualBandwidth);
+  const esp_err_t channelReadResult =
+      esp_wifi_get_channel(
+          &actualPrimaryChannel, &actualSecondaryChannel);
+  Serial.printf(
+      "Transfer AP radio: requested=HT20 configured=%s "
+      "channel_result=%d actual_bw=%s primary=%u secondary=%d "
+      "read_ok=%s\n",
+      bandwidthConfigured ? "true" : "false",
+      channelConfigured,
+      bandwidthReadResult == ESP_OK && actualBandwidth == WIFI_BW_HT20
+          ? "HT20"
+          : "HT40",
+      static_cast<unsigned int>(actualPrimaryChannel),
+      static_cast<int>(actualSecondaryChannel),
+      bandwidthReadResult == ESP_OK && channelReadResult == ESP_OK
+          ? "true"
+          : "false");
+
   gTransferServer.reset(new WebServer(80));
   if (!gTransferServer) {
     WiFi.softAPdisconnect(true);
@@ -759,6 +1287,12 @@ void NearNestConnectivity::startTransferAccessPoint() {
       });
   gTransferServer->on(
       "/v1/benchmark", HTTP_GET, [this]() { serveNetworkBenchmark(); });
+  gTransferServer->on(
+      "/v1/benchmark/udp", HTTP_GET,
+      [this]() { startUdpNetworkBenchmark(); });
+  gTransferServer->on(
+      "/v1/recording/udp", HTTP_GET,
+      [this]() { startUdpRecordingTransfer(); });
   gTransferServer->on(
       "/v1/recording", HTTP_GET, [this]() { serveRecordingRange(); });
   gTransferServer->onNotFound([]() {
@@ -783,7 +1317,7 @@ void NearNestConnectivity::startTransferAccessPoint() {
   if (gBleConnectionHandle != BLE_HS_CONN_HANDLE_NONE) {
     // Give the encrypted notification time to reach the phone, then remove
     // the active BLE connection from the shared 2.4 GHz radio. Advertising
-    // resumes after disconnect so the app can reconnect to stop the AP.
+    // stays paused until the transfer AP stops.
     gBleDisconnectAtMs = millis() + kBleHandoffDelayMs;
   }
 }
@@ -832,8 +1366,8 @@ void NearNestConnectivity::serveNetworkBenchmark() {
         (index * 31U + 17U) & 0xffU);
   }
 
-  // Advertising alone can preempt the shared 2.4 GHz radio. Pause it only
-  // for this diagnostic so the result measures Wi-Fi rather than coexistence.
+  // Advertising alone can preempt the shared 2.4 GHz radio. Pause it while
+  // measuring so the result reflects Wi-Fi throughput.
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
   const bool resumeAdvertising =
       advertising && advertising->isAdvertising();
@@ -866,7 +1400,6 @@ void NearNestConnectivity::serveNetworkBenchmark() {
     }
     remaining -= static_cast<uint32_t>(written);
     lastWriteAtMs = millis();
-    delay(1);
   }
 
   const uint32_t elapsedMs =
@@ -889,6 +1422,134 @@ void NearNestConnectivity::serveNetworkBenchmark() {
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getMinFreeHeap()),
       remaining == 0 ? "complete" : "interrupted");
+}
+
+void NearNestConnectivity::startUdpNetworkBenchmark() {
+  gTransferLastActivityMs = millis();
+  if (!gTransferServer ||
+      gTransferServer->header(kTransferTokenHeader) != gTransferToken) {
+    if (gTransferServer) {
+      gTransferServer->send(
+          401, "application/json", "{\"error\":\"unauthorized\"}");
+    }
+    return;
+  }
+  const long requestedPort = gTransferServer->arg("port").toInt();
+  if (requestedPort < 1024 || requestedPort > 65535) {
+    gTransferServer->send(
+        400, "application/json", "{\"error\":\"invalid_port\"}");
+    return;
+  }
+  if (gUdpBenchmarkRunning) {
+    gTransferServer->send(
+        409, "application/json", "{\"error\":\"benchmark_running\"}");
+    return;
+  }
+
+  std::unique_ptr<UdpBenchmarkContext> context(new UdpBenchmarkContext{
+      .address = gTransferServer->client().remoteIP(),
+      .port = static_cast<uint16_t>(requestedPort),
+      .session = esp_random(),
+  });
+  if (!context) {
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"insufficient_memory\"}");
+    return;
+  }
+  const uint32_t packetCount =
+      (kNetworkBenchmarkBytes + kUdpBenchmarkPayloadBytes - 1) /
+      kUdpBenchmarkPayloadBytes;
+  gUdpBenchmarkRunning = true;
+  const uint32_t session = context->session;
+  if (xTaskCreatePinnedToCore(
+          udpBenchmarkTask, "udp-benchmark", 4096, context.get(), 2,
+          nullptr, 1) != pdPASS) {
+    gUdpBenchmarkRunning = false;
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"task_unavailable\"}");
+    return;
+  }
+  context.release();
+  gTransferServer->send(
+      202, "application/json",
+      String("{\"bytes\":") + String(kNetworkBenchmarkBytes) +
+          ",\"payloadBytes\":" + String(kUdpBenchmarkPayloadBytes) +
+          ",\"packets\":" + String(packetCount) +
+          ",\"session\":" + String(session) + "}");
+}
+
+void NearNestConnectivity::startUdpRecordingTransfer() {
+  gTransferLastActivityMs = millis();
+  if (!gTransferServer ||
+      gTransferServer->header(kTransferTokenHeader) != gTransferToken) {
+    if (gTransferServer) {
+      gTransferServer->send(
+          401, "application/json", "{\"error\":\"unauthorized\"}");
+    }
+    return;
+  }
+  const long requestedPort = gTransferServer->arg("port").toInt();
+  const String recordingId = gTransferServer->arg("recordingId");
+  uint64_t offsetBytes = 0;
+  uint64_t requestedLength = 0;
+  uint64_t recordingSize = 0;
+  String path;
+  if (requestedPort < 1024 || requestedPort > 65535 ||
+      !parseUnsignedArgument(
+          gTransferServer->arg("offsetBytes"), offsetBytes) ||
+      !parseUnsignedArgument(
+          gTransferServer->arg("lengthBytes"), requestedLength) ||
+      requestedLength == 0 ||
+      requestedLength > kMaximumTransferRangeBytes ||
+      !resolveRecording(recordingId, path, recordingSize) ||
+      offsetBytes > recordingSize ||
+      requestedLength > recordingSize - offsetBytes) {
+    gTransferServer->send(
+        416, "application/json", "{\"error\":\"invalid_range\"}");
+    return;
+  }
+  if (gUdpRecordingTransferRunning) {
+    gTransferServer->send(
+        409, "application/json", "{\"error\":\"transfer_running\"}");
+    return;
+  }
+
+  std::unique_ptr<UdpRecordingContext> context(new UdpRecordingContext{
+      .storage = storage_,
+      .storageMutex = storageMutex_,
+      .address = gTransferServer->client().remoteIP(),
+      .path = path,
+      .offsetBytes = offsetBytes,
+      .lengthBytes = static_cast<uint32_t>(requestedLength),
+      .port = static_cast<uint16_t>(requestedPort),
+      .session = esp_random(),
+  });
+  if (!context) {
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"insufficient_memory\"}");
+    return;
+  }
+  const uint32_t packetCount =
+      (requestedLength + kUdpRecordingPayloadBytes - 1) /
+      kUdpRecordingPayloadBytes;
+  const uint32_t session = context->session;
+  gUdpRecordingTransferRunning = true;
+  if (xTaskCreatePinnedToCore(
+          udpRecordingTask, "udp-recording", 4096, context.get(), 2,
+          nullptr, 0) != pdPASS) {
+    gUdpRecordingTransferRunning = false;
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"task_unavailable\"}");
+    return;
+  }
+  context.release();
+  gTransferServer->send(
+      202, "application/json",
+      String("{\"bytes\":") +
+          String(static_cast<unsigned long>(requestedLength)) +
+          ",\"payloadBytes\":" + String(kUdpRecordingPayloadBytes) +
+          ",\"packets\":" + String(packetCount) +
+          ",\"session\":" + String(session) + "}");
 }
 
 void NearNestConnectivity::serveRecordingRange() {
@@ -943,6 +1604,69 @@ void NearNestConnectivity::serveRecordingRange() {
     return;
   }
 
+  std::unique_ptr<uint8_t[]> buffer(new uint8_t[kTransferBufferBytes]);
+  QueueHandle_t freeBlocks =
+      xQueueCreate(kTransferPipelineBlockCount, sizeof(uint8_t));
+  QueueHandle_t readyBlocks =
+      xQueueCreate(kTransferPipelineBlockCount, sizeof(TransferReadyBlock));
+  SemaphoreHandle_t readerFinished = xSemaphoreCreateBinary();
+  if (!buffer || !freeBlocks || !readyBlocks || !readerFinished) {
+    if (freeBlocks) vQueueDelete(freeBlocks);
+    if (readyBlocks) vQueueDelete(readyBlocks);
+    if (readerFinished) vSemaphoreDelete(readerFinished);
+    file.close();
+    if (storageMutex_) xSemaphoreGive(storageMutex_);
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"transfer_memory\"}");
+    return;
+  }
+
+  for (uint8_t blockIndex = 0;
+       blockIndex < kTransferPipelineBlockCount; ++blockIndex) {
+    xQueueSend(freeBlocks, &blockIndex, 0);
+  }
+  TransferReadContext readContext = {
+      .file = &file,
+      .buffer = buffer.get(),
+      .freeBlocks = freeBlocks,
+      .readyBlocks = readyBlocks,
+      .finished = readerFinished,
+      .remainingBytes = lengthBytes,
+      .sdReadElapsedMs = 0,
+      .freeBlockWaitElapsedMs = 0,
+      .blocksRead = 0,
+      .cancelled = false,
+      .producerDone = false,
+      .readFailed = false,
+  };
+  TaskHandle_t readerTask = nullptr;
+  if (xTaskCreatePinnedToCore(
+          transferSdReaderTask,
+          "transferSdReader",
+          3072,
+          &readContext,
+          2,
+          &readerTask,
+          1) != pdPASS) {
+    vQueueDelete(freeBlocks);
+    vQueueDelete(readyBlocks);
+    vSemaphoreDelete(readerFinished);
+    file.close();
+    if (storageMutex_) xSemaphoreGive(storageMutex_);
+    gTransferServer->send(
+        503, "application/json", "{\"error\":\"transfer_task\"}");
+    return;
+  }
+
+  // Pause BLE advertising only while bytes are flowing. It resumes between
+  // HTTP ranges so the app can reconnect and send transfer.ap.stop after it
+  // leaves the temporary Wi-Fi network.
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  const bool resumeAdvertising =
+      advertising && advertising->isAdvertising();
+  if (resumeAdvertising) advertising->stop();
+  delay(20);
+
   WiFiClient client = gTransferServer->client();
   client.setNoDelay(true);
   client.printf(
@@ -958,34 +1682,34 @@ void NearNestConnectivity::serveRecordingRange() {
       static_cast<unsigned long long>(offsetBytes + lengthBytes - 1),
       static_cast<unsigned long long>(recordingSize));
 
-  std::unique_ptr<uint8_t[]> buffer(new uint8_t[kTransferBufferBytes]);
-  if (!buffer) {
-    file.close();
-    if (storageMutex_) xSemaphoreGive(storageMutex_);
-    client.stop();
-    return;
-  }
   uint32_t remaining = lengthBytes;
   bool succeeded = true;
-  uint32_t sdReadElapsedMs = 0;
   uint32_t wifiWriteElapsedMs = 0;
+  uint32_t pipelineWaitElapsedMs = 0;
   const uint32_t transferStartedAtMs = millis();
   while (remaining > 0 && client.connected()) {
-    const size_t wanted =
-        remaining < kTransferBufferBytes ? remaining : kTransferBufferBytes;
-    const uint32_t readStartedAtMs = millis();
-    const size_t read = file.read(buffer.get(), wanted);
-    sdReadElapsedMs += millis() - readStartedAtMs;
-    if (read == 0) {
-      succeeded = false;
-      break;
+    TransferReadyBlock readyBlock {};
+    const uint32_t waitStartedAtMs = millis();
+    const BaseType_t received = xQueueReceive(
+        readyBlocks, &readyBlock, pdMS_TO_TICKS(1000));
+    pipelineWaitElapsedMs += millis() - waitStartedAtMs;
+    if (received != pdTRUE) {
+      if (readContext.producerDone) {
+        succeeded = false;
+        break;
+      }
+      continue;
     }
+
+    uint8_t *block =
+        buffer.get() +
+        static_cast<size_t>(readyBlock.index) * kTransferPipelineBlockBytes;
     size_t written = 0;
     uint32_t lastWriteAt = millis();
     const uint32_t writeStartedAtMs = millis();
-    while (written < read && client.connected()) {
+    while (written < readyBlock.bytes && client.connected()) {
       const size_t count =
-          client.write(buffer.get() + written, read - written);
+          client.write(block + written, readyBlock.bytes - written);
       if (count == 0) {
         if (millis() - lastWriteAt > 15000) break;
         delay(1);
@@ -995,16 +1719,29 @@ void NearNestConnectivity::serveRecordingRange() {
       lastWriteAt = millis();
     }
     wifiWriteElapsedMs += millis() - writeStartedAtMs;
-    if (written != read) {
+    if (written != readyBlock.bytes) {
       succeeded = false;
       break;
     }
-    remaining -= static_cast<uint32_t>(read);
-    delay(1);
+    remaining -= static_cast<uint32_t>(readyBlock.bytes);
+    xQueueSend(freeBlocks, &readyBlock.index, 0);
   }
+
+  readContext.cancelled = true;
+  xSemaphoreTake(readerFinished, portMAX_DELAY);
+  succeeded =
+      succeeded && !readContext.readFailed && remaining == 0;
+  const uint32_t sdReadElapsedMs = readContext.sdReadElapsedMs;
+  const uint32_t producerWaitElapsedMs =
+      readContext.freeBlockWaitElapsedMs;
+  const uint32_t blocksRead = readContext.blocksRead;
   file.close();
   if (storageMutex_) xSemaphoreGive(storageMutex_);
   client.stop();
+  if (resumeAdvertising) advertising->start();
+  vQueueDelete(freeBlocks);
+  vQueueDelete(readyBlocks);
+  vSemaphoreDelete(readerFinished);
   const uint32_t measuredElapsedMs = millis() - transferStartedAtMs;
   const uint32_t elapsedMs =
       measuredElapsedMs == 0 ? 1 : measuredElapsedMs;
@@ -1015,19 +1752,24 @@ void NearNestConnectivity::serveRecordingRange() {
           elapsedMs / 1024ULL);
   Serial.printf(
       "Transfer range: recording=%s offset=%llu bytes=%lu elapsed_ms=%lu "
-      "sd_read_ms=%lu wifi_write_ms=%lu speed_kib_s=%lu channel=%u "
-      "free_heap=%lu min_free_heap=%lu result=%s\n",
+      "sd_read_ms=%lu wifi_write_ms=%lu consumer_wait_ms=%lu "
+      "producer_wait_ms=%lu blocks=%lu "
+      "speed_kib_s=%lu channel=%u free_heap=%lu min_free_heap=%lu "
+      "result=%s\n",
       recordingId.c_str(),
       static_cast<unsigned long long>(offsetBytes),
       static_cast<unsigned long>(lengthBytes),
       static_cast<unsigned long>(elapsedMs),
       static_cast<unsigned long>(sdReadElapsedMs),
       static_cast<unsigned long>(wifiWriteElapsedMs),
+      static_cast<unsigned long>(pipelineWaitElapsedMs),
+      static_cast<unsigned long>(producerWaitElapsedMs),
+      static_cast<unsigned long>(blocksRead),
       static_cast<unsigned long>(kibPerSecond),
       static_cast<unsigned int>(gTransferApChannel),
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getMinFreeHeap()),
-      succeeded && remaining == 0 ? "complete" : "interrupted");
+      succeeded ? "complete" : "interrupted");
 }
 
 void NearNestConnectivity::releaseRecording(const String &recordingId) {
