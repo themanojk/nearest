@@ -1,12 +1,16 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPSPlus.h>
+#include "NearNestConnectivity.h"
+#include "device_secrets.h"
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <esp_system.h>
 
 #if !defined(ARDUINO_ARCH_ESP32)
 #error "This sketch requires an ESP32 board package and an ESP32-family board selection in Arduino IDE."
@@ -23,7 +27,6 @@ namespace {
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint8_t kBitsPerSample = 16;
 constexpr size_t kSamplesPerChunk = 512;
-constexpr uint32_t kStartupDelayMs = 0;
 constexpr uint32_t kRecordingHeartbeatMs = 0;
 constexpr uint32_t kRecordingProgressLogIntervalMs = 10000;
 constexpr uint32_t kHeaderSyncIntervalMs = 5000;
@@ -44,13 +47,20 @@ constexpr uint8_t kAudioPostScalePercent = 90;
 
 constexpr gpio_num_t kI2sBclkPin = GPIO_NUM_26;
 constexpr gpio_num_t kI2sWsPin = GPIO_NUM_25;
-constexpr gpio_num_t kI2sDataInPin = GPIO_NUM_33;¯
+constexpr gpio_num_t kI2sDataInPin = GPIO_NUM_33;
 
 constexpr int kSdCsPin = 5;
 constexpr int kSdSckPin = 18;
 constexpr int kSdMisoPin = 19;
 constexpr int kSdMosiPin = 23;
 constexpr uint32_t kSdSpiFrequency = 4000000;
+constexpr uint32_t kSdTransferSpiFrequencies[] = {
+    40000000,
+    20000000,
+    10000000,
+    kSdSpiFrequency,
+};
+constexpr size_t kSdTransferProbeBytes = 64 * 1024;
 
 constexpr int kBuzzerPin = 22;
 constexpr int kGpsRxPin = 16;
@@ -61,6 +71,9 @@ constexpr uint32_t kGpsLogIntervalMs = 2000;
 constexpr uint32_t kGpsPersistIntervalMs = 120000;
 constexpr uint32_t kGpsNoDataLogIntervalMs = 2000;
 constexpr uint32_t kGpsBaudScanIntervalMs = 2000;
+// GPS collection and SD persistence remain enabled. Set this to true only when
+// diagnosing the GPS module from the Arduino Serial Monitor.
+constexpr bool kGpsSerialLogsEnabled = false;
 constexpr uint8_t kGpsFixBeepCount = 5;
 constexpr uint16_t kGpsFixBeepOnMs = 70;
 constexpr uint16_t kGpsFixBeepOffMs = 90;
@@ -72,7 +85,6 @@ constexpr char kRecordingMetaFile[] = "/recording_meta.txt";
 constexpr char kGpsHistoryFile[] = "/gps_history.csv";
 
 enum class RecorderState {
-  WaitingToStart,
   Recording,
   Stopped,
   Error,
@@ -94,7 +106,8 @@ struct WavHeader {
   uint32_t subchunk2Size;
 };
 
-RecorderState gState = RecorderState::WaitingToStart;
+RecorderState gState = RecorderState::Stopped;
+NearNestConnectivity gConnectivity;
 SPIClass gSdSpi(VSPI);
 HardwareSerial gGpsSerial(1);
 TinyGPSPlus gTinyGps;
@@ -137,6 +150,7 @@ bool gBuzzerPinLevel = false;
 bool gProblemIndicatorEnabled = false;
 bool gMicReady = false;
 bool gSdReady = false;
+uint32_t gSdCurrentSpiFrequency = kSdSpiFrequency;
 bool gGpsReady = false;
 bool gGpsHasLocation = false;
 bool gGpsHasUtc = false;
@@ -144,6 +158,7 @@ bool gGpsLockAnnounced = false;
 bool gGpsFixBeepPlayed = false;
 bool gRecordingStartUtcResolved = false;
 bool gFirstFixMetadataWritten = false;
+bool gRecordingPublishedForTransfer = false;
 
 char gGpsSentenceBuffer[128];
 size_t gGpsSentenceLength = 0;
@@ -174,11 +189,38 @@ float gLowPassPrevOutput = 0.0f;
 void startBuzzerPattern(uint8_t beepCount, uint16_t onMs, uint16_t offMs);
 void recordingTaskMain(void *parameter);
 const char *gpsStateLabel();
+bool enterTransferStorageMode(const String &probePath);
+void leaveTransferStorageMode();
+
+const char *resetReasonLabel(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power_on";
+    case ESP_RST_EXT:
+      return "external";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT:
+      return "task_watchdog";
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_DEEPSLEEP:
+      return "deep_sleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    default:
+      return "unknown";
+  }
+}
 
 const char *recorderStateLabel() {
   switch (gState) {
-    case RecorderState::WaitingToStart:
-      return "WAITING_TO_START";
     case RecorderState::Recording:
       return "RECORDING";
     case RecorderState::Stopped:
@@ -190,13 +232,12 @@ const char *recorderStateLabel() {
 }
 
 void logBuzzerPatternRequest(const char *reason, uint8_t beepCount, uint16_t onMs, uint16_t offMs) {
-  Serial.printf("Buzzer: reason=%s beeps=%u on_ms=%u off_ms=%u state=%s gps=%s recording_file=%s bytes=%lu\n",
+  Serial.printf("Buzzer: reason=%s beeps=%u on_ms=%u off_ms=%u state=%s recording_file=%s bytes=%lu\n",
                 reason ? reason : "unspecified",
                 static_cast<unsigned int>(beepCount),
                 static_cast<unsigned int>(onMs),
                 static_cast<unsigned int>(offMs),
                 recorderStateLabel(),
-                gpsStateLabel(),
                 gRecordingPath.isEmpty() ? "none" : gRecordingPath.c_str(),
                 static_cast<unsigned long>(gRecordingDataBytes));
 }
@@ -658,24 +699,26 @@ void appendGpsHistoryEntry(const char *eventLabel) {
   const String longitudeText = gGpsHasLocation ? String(gGpsLongitude, 6) : String("na");
   const uint32_t pointIndex = ++gRecordingGpsPointIndex;
 
-  Serial.printf(
-      "GPS save: point=%lu event=%s file=%s start_utc=%s fix_utc=%s elapsed_ms=%lu lat=%s lon=%s alt=%.2f hdop=%.2f sats=%u/%u fix_quality=%u fix_type=%u speed=%.2f course=%.2f\n",
-      static_cast<unsigned long>(pointIndex),
-      event,
-      recordingFile,
-      recordingStartUtc,
-      gpsFixUtc,
-      elapsedSinceStartMs,
-      latitudeText.c_str(),
-      longitudeText.c_str(),
-      gGpsAltitudeMeters,
-      gGpsHdop,
-      gGpsSatellites,
-      gGpsSatellitesInView,
-      gGpsFixQuality,
-      gGpsFixType,
-      gGpsSpeedKnots,
-      gGpsCourseDegrees);
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf(
+        "GPS save: point=%lu event=%s file=%s start_utc=%s fix_utc=%s elapsed_ms=%lu lat=%s lon=%s alt=%.2f hdop=%.2f sats=%u/%u fix_quality=%u fix_type=%u speed=%.2f course=%.2f\n",
+        static_cast<unsigned long>(pointIndex),
+        event,
+        recordingFile,
+        recordingStartUtc,
+        gpsFixUtc,
+        elapsedSinceStartMs,
+        latitudeText.c_str(),
+        longitudeText.c_str(),
+        gGpsAltitudeMeters,
+        gGpsHdop,
+        gGpsSatellites,
+        gGpsSatellitesInView,
+        gGpsFixQuality,
+        gGpsFixType,
+        gGpsSpeedKnots,
+        gGpsCourseDegrees);
+  }
 
   if (!historyFileExists) {
     historyFile.println(header);
@@ -734,11 +777,13 @@ void appendGpsHistoryEntry(const char *eventLabel) {
   perRecordingFile.close();
   unlockSd();
 
-  Serial.printf("GPS trail append: event=%s trail=%s fix_utc=%s elapsed_ms=%lu\n",
-                event,
-                perRecordingTrailPath.c_str(),
-                gpsFixUtc,
-                elapsedSinceStartMs);
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf("GPS trail append: event=%s trail=%s fix_utc=%s elapsed_ms=%lu\n",
+                  event,
+                  perRecordingTrailPath.c_str(),
+                  gpsFixUtc,
+                  elapsedSinceStartMs);
+  }
 }
 
 void persistGpsFilesIfDue(uint32_t now, bool force) {
@@ -753,12 +798,14 @@ void persistGpsFilesIfDue(uint32_t now, bool force) {
   appendGpsHistoryEntry(gGpsHasUtc ? "periodic_fix_update" : "periodic_waiting_for_fix");
   gLastGpsPersistMs = now;
 
-  Serial.printf("GPS point appended: state=%s file=%s fix_utc=%s lat=%s lon=%s\n",
-                gpsStateLabel(),
-                gRecordingPath.c_str(),
-                gGpsHasUtc ? gGpsLastUtcIso.c_str() : "not_available",
-                gGpsHasLocation ? String(gGpsLatitude, 6).c_str() : "na",
-                gGpsHasLocation ? String(gGpsLongitude, 6).c_str() : "na");
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf("GPS point appended: state=%s file=%s fix_utc=%s lat=%s lon=%s\n",
+                  gpsStateLabel(),
+                  gRecordingPath.c_str(),
+                  gGpsHasUtc ? gGpsLastUtcIso.c_str() : "not_available",
+                  gGpsHasLocation ? String(gGpsLatitude, 6).c_str() : "na",
+                  gGpsHasLocation ? String(gGpsLongitude, 6).c_str() : "na");
+  }
 }
 
 void maybeResolveRecordingStartUtc() {
@@ -773,9 +820,11 @@ void maybeResolveRecordingStartUtc() {
   gRecordingStartUtcResolved = !gRecordingStartUtcIso.isEmpty();
 
   if (gRecordingStartUtcResolved && !wasResolved) {
-    Serial.printf("GPS start UTC resolved: record_start_utc=%s gps_fix_utc=%s fix_latency_ms=%lu\n",
-                  gRecordingStartUtcIso.c_str(), gGpsLastUtcIso.c_str(),
-                  static_cast<unsigned long>(gGpsLastFixMs >= gRecordingStartMs ? (gGpsLastFixMs - gRecordingStartMs) : 0));
+    if (kGpsSerialLogsEnabled) {
+      Serial.printf("GPS start UTC resolved: record_start_utc=%s gps_fix_utc=%s fix_latency_ms=%lu\n",
+                    gRecordingStartUtcIso.c_str(), gGpsLastUtcIso.c_str(),
+                    static_cast<unsigned long>(gGpsLastFixMs >= gRecordingStartMs ? (gGpsLastFixMs - gRecordingStartMs) : 0));
+    }
     if (!gRecordingPath.isEmpty() && gSdReady) {
       writeIndexSnapshot();
       writeGpsStatusSnapshot("fix_acquired");
@@ -786,6 +835,10 @@ void maybeResolveRecordingStartUtc() {
 }
 
 void logGpsFix() {
+  if (!kGpsSerialLogsEnabled) {
+    return;
+  }
+
   Serial.printf(
       "GPS fix: state=%s baud=%lu utc=%s lat=%.6f lon=%.6f alt=%.2f m sats=%u/%u fix_quality=%u fix_type=%u rmc_status=%c hdop=%.2f speed=%.2f kn course=%.2f deg fix_sentences=%lu fix_millis=%lu",
       gpsStateLabel(),
@@ -802,6 +855,10 @@ void logGpsFix() {
 }
 
 void logGpsStatusNoFix() {
+  if (!kGpsSerialLogsEnabled) {
+    return;
+  }
+
   const String latitudeText = gTinyGps.location.isValid() ? String(gGpsLatitude, 6) : String("na");
   const String longitudeText = gTinyGps.location.isValid() ? String(gGpsLongitude, 6) : String("na");
 
@@ -822,6 +879,10 @@ void logGpsStatusNoFix() {
 }
 
 void logGpsStatusTick() {
+  if (!kGpsSerialLogsEnabled) {
+    return;
+  }
+
   const uint32_t now = millis();
   if (gLastGpsLogMs != 0 && (now - gLastGpsLogMs) < kGpsLogIntervalMs) {
     return;
@@ -866,16 +927,20 @@ void handleGpsFixUpdate() {
     gFirstFixMetadataWritten = true;
     writeRecordingMetadata();
     appendGpsHistoryEntry("first_fix_saved");
-    Serial.printf("GPS first fix saved: file=%s utc=%s lat=%.6f lon=%.6f\n",
-                  gRecordingPath.c_str(),
-                  gGpsLastUtcIso.c_str(),
-                  gGpsLatitude,
-                  gGpsLongitude);
+    if (kGpsSerialLogsEnabled) {
+      Serial.printf("GPS first fix saved: file=%s utc=%s lat=%.6f lon=%.6f\n",
+                    gRecordingPath.c_str(),
+                    gGpsLastUtcIso.c_str(),
+                    gGpsLatitude,
+                    gGpsLongitude);
+    }
   }
 
   if (gGpsHasUtc && !hadUtcFixBefore && !gGpsLockAnnounced) {
     gGpsLockAnnounced = true;
-    Serial.println("GPS lock acquired");
+    if (kGpsSerialLogsEnabled) {
+      Serial.println("GPS lock acquired");
+    }
   }
 
   if (gTinyGps.location.isValid() && gGpsHasUtc && !gGpsFixBeepPlayed) {
@@ -885,10 +950,12 @@ void handleGpsFixUpdate() {
                             kGpsFixBeepOnMs,
                             kGpsFixBeepOffMs);
     startBuzzerPattern(kGpsFixBeepCount, kGpsFixBeepOnMs, kGpsFixBeepOffMs);
-    Serial.printf("GPS location fix acquired: lat=%.6f lon=%.6f utc=%s\n",
-                  gGpsLatitude,
-                  gGpsLongitude,
-                  gGpsLastUtcIso.c_str());
+    if (kGpsSerialLogsEnabled) {
+      Serial.printf("GPS location fix acquired: lat=%.6f lon=%.6f utc=%s\n",
+                    gGpsLatitude,
+                    gGpsLongitude,
+                    gGpsLastUtcIso.c_str());
+    }
   }
 }
 
@@ -903,7 +970,9 @@ void setGpsBaudIndex(size_t baudIndex) {
   gLastGpsByteMs = 0;
   gLastGpsNoDataLogMs = 0;
   gLastGpsBaudSwitchMs = millis();
-  Serial.printf("GPS baud switched to %lu\n", static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf("GPS baud switched to %lu\n", static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
+  }
 }
 
 void serviceGps() {
@@ -932,7 +1001,8 @@ void serviceGps() {
     if ((now - gLastGpsBaudSwitchMs) >= kGpsBaudScanIntervalMs) {
       setGpsBaudIndex((gGpsBaudIndex + 1) % kGpsBaudRateCount);
     }
-    if (gLastGpsNoDataLogMs == 0 || (now - gLastGpsNoDataLogMs) >= kGpsNoDataLogIntervalMs) {
+    if (kGpsSerialLogsEnabled &&
+        (gLastGpsNoDataLogMs == 0 || (now - gLastGpsNoDataLogMs) >= kGpsNoDataLogIntervalMs)) {
       Serial.printf("GPS retry: no bytes received yet at baud=%lu, switching every %lu ms, chars=%lu\n",
                     static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]),
                     static_cast<unsigned long>(kGpsBaudScanIntervalMs),
@@ -942,7 +1012,7 @@ void serviceGps() {
     return;
   }
 
-  if (bytesReadThisPass == 0 && gLastGpsByteMs > 0 &&
+  if (kGpsSerialLogsEnabled && bytesReadThisPass == 0 && gLastGpsByteMs > 0 &&
       (now - gLastGpsByteMs) >= kGpsNoDataLogIntervalMs &&
       (gLastGpsNoDataLogMs == 0 || (now - gLastGpsNoDataLogMs) >= kGpsNoDataLogIntervalMs)) {
     Serial.printf("GPS stalled: last_byte_ms_ago=%lu baud=%lu chars=%lu ok=%lu bad=%lu state=%s\n",
@@ -956,7 +1026,7 @@ void serviceGps() {
     return;
   }
 
-  if (!gGpsHasUtc &&
+  if (kGpsSerialLogsEnabled && !gGpsHasUtc &&
       (gLastGpsNoDataLogMs == 0 || (now - gLastGpsNoDataLogMs) >= kGpsNoDataLogIntervalMs)) {
     logGpsStatusNoFix();
     gLastGpsNoDataLogMs = now;
@@ -1017,7 +1087,7 @@ void serviceBuzzer() {
     }
     if (gBuzzerPhaseRemaining == 0) {
       gBuzzerActive = false;
-      Serial.println("Buzzer: pattern complete");
+      // Serial.println("Buzzer: pattern complete");
       return;
     }
     gBuzzerToggleAtMs = now + gBuzzerOffMs;
@@ -1056,6 +1126,42 @@ bool writeWavHeader(File &file, uint32_t dataBytes) {
   return written == sizeof(header);
 }
 
+bool reopenRecordingFileForWrite(uint32_t dataBytes) {
+  if (gRecordingFile) {
+    gRecordingFile.close();
+  }
+
+  gRecordingFile = SD.open(gRecordingPath.c_str(), "r+");
+  if (!gRecordingFile) {
+    return false;
+  }
+
+  const uint32_t resumeOffset = sizeof(WavHeader) + dataBytes;
+  if (gRecordingFile.size() < resumeOffset ||
+      !gRecordingFile.seek(resumeOffset)) {
+    gRecordingFile.close();
+    return false;
+  }
+
+  return true;
+}
+
+bool finalizeRecordingFile() {
+  if (gRecordingFile) {
+    gRecordingFile.flush();
+    gRecordingFile.close();
+  }
+
+  File headerFile = SD.open(gRecordingPath.c_str(), "r+");
+  if (!headerFile) {
+    return false;
+  }
+
+  const bool headerWritten = writeWavHeader(headerFile, gRecordingDataBytes);
+  headerFile.close();
+  return headerWritten;
+}
+
 bool checkpointRecordingFile() {
   if (!gRecordingFile) {
     return false;
@@ -1079,18 +1185,8 @@ bool checkpointRecordingFile() {
   }
   headerFile.close();
 
-  gRecordingFile = SD.open(gRecordingPath.c_str(), FILE_APPEND);
-  if (!gRecordingFile) {
+  if (!reopenRecordingFileForWrite(gRecordingDataBytes)) {
     Serial.printf("WARN: checkpoint reopen-for-append failed for %s\n", gRecordingPath.c_str());
-    return false;
-  }
-
-  const uint32_t resumeOffset = sizeof(WavHeader) + gRecordingDataBytes;
-  if (!gRecordingFile.seek(resumeOffset)) {
-    Serial.printf("WARN: checkpoint seek-to-append failed for %s offset=%lu\n",
-                  gRecordingPath.c_str(),
-                  static_cast<unsigned long>(resumeOffset));
-    gRecordingFile.close();
     return false;
   }
 
@@ -1108,17 +1204,31 @@ bool ensureRecordingDirectory() {
 }
 
 String allocateRecordingPath() {
-  for (uint16_t i = 1; i < 10000; ++i) {
-    char path[40];
+  Preferences preferences;
+  if (!preferences.begin("nearnest-rec", false)) {
+    Serial.println("ERROR: could not open persistent recording sequence");
+    return String();
+  }
+  uint32_t sequence = preferences.getUInt("next", 1);
+  if (sequence == 0) sequence = 1;
+  for (uint32_t attempts = 0; attempts < 100000; ++attempts, ++sequence) {
+    char path[48];
     if (strcmp(kRecordingDir, "/") == 0) {
-      snprintf(path, sizeof(path), "/rec_%04u.wav", i);
+      snprintf(
+          path, sizeof(path), "/rec_%08lu.wav",
+          static_cast<unsigned long>(sequence));
     } else {
-      snprintf(path, sizeof(path), "%s/rec_%04u.wav", kRecordingDir, i);
+      snprintf(
+          path, sizeof(path), "%s/rec_%08lu.wav", kRecordingDir,
+          static_cast<unsigned long>(sequence));
     }
     if (!SD.exists(path)) {
+      preferences.putUInt("next", sequence + 1);
+      preferences.end();
       return String(path);
     }
   }
+  preferences.end();
   return String();
 }
 
@@ -1178,6 +1288,7 @@ bool setupSdCard() {
     Serial.println("ERROR: SD.begin failed");
     return false;
   }
+  gSdCurrentSpiFrequency = kSdSpiFrequency;
 
   if (!ensureRecordingDirectory()) {
     Serial.printf("ERROR: could not prepare recording directory '%s'\n", kRecordingDir);
@@ -1213,6 +1324,113 @@ bool setupSdCard() {
                 cardTypeLabel, cardSizeMb, totalMb, usedMb,
                 static_cast<unsigned long>(kSdSpiFrequency));
   return true;
+}
+
+bool readSdProbe(const String &path,
+                 uint32_t &fingerprint,
+                 size_t &bytesRead,
+                 uint32_t &elapsedMs) {
+  fingerprint = 2166136261UL;
+  bytesRead = 0;
+  elapsedMs = 0;
+  if (path.isEmpty()) return true;
+
+  File probe = SD.open(path.c_str(), FILE_READ);
+  if (!probe) return false;
+  uint8_t buffer[1024];
+  const uint32_t startedAtMs = millis();
+  while (bytesRead < kSdTransferProbeBytes) {
+    const size_t wanted =
+        min(sizeof(buffer), kSdTransferProbeBytes - bytesRead);
+    const size_t count = probe.read(buffer, wanted);
+    if (count == 0) break;
+    for (size_t index = 0; index < count; ++index) {
+      fingerprint ^= buffer[index];
+      fingerprint *= 16777619UL;
+    }
+    bytesRead += count;
+  }
+  elapsedMs = millis() - startedAtMs;
+  probe.close();
+  return bytesRead > 0;
+}
+
+bool remountSdAtFrequency(uint32_t frequency) {
+  SD.end();
+  delay(20);
+  if (!SD.begin(kSdCsPin, gSdSpi, frequency)) {
+    return false;
+  }
+  gSdCurrentSpiFrequency = frequency;
+  return SD.cardType() != CARD_NONE;
+}
+
+bool enterTransferStorageMode(const String &probePath) {
+  if (!gSdReady || !lockSd(pdMS_TO_TICKS(5000))) return false;
+
+  uint32_t safeFingerprint = 0;
+  size_t safeProbeBytes = 0;
+  uint32_t safeProbeElapsedMs = 0;
+  const bool haveProbe =
+      readSdProbe(
+          probePath, safeFingerprint, safeProbeBytes, safeProbeElapsedMs);
+  bool mounted = false;
+  for (const uint32_t frequency : kSdTransferSpiFrequencies) {
+    if (!remountSdAtFrequency(frequency)) {
+      Serial.printf("WARN: SD transfer mount failed at %lu Hz\n",
+                    static_cast<unsigned long>(frequency));
+      continue;
+    }
+
+    uint32_t candidateFingerprint = 0;
+    size_t candidateProbeBytes = 0;
+    uint32_t candidateProbeElapsedMs = 0;
+    const bool probeMatches =
+        !haveProbe ||
+        (readSdProbe(
+             probePath,
+             candidateFingerprint,
+             candidateProbeBytes,
+             candidateProbeElapsedMs) &&
+         candidateProbeBytes == safeProbeBytes &&
+         candidateFingerprint == safeFingerprint);
+    if (probeMatches) {
+      mounted = true;
+      Serial.printf(
+          "SD transfer mode ready: freq=%lu Hz probe_bytes=%u "
+          "probe_ms=%lu probe_kib_s=%lu\n",
+          static_cast<unsigned long>(frequency),
+          static_cast<unsigned int>(candidateProbeBytes),
+          static_cast<unsigned long>(candidateProbeElapsedMs),
+          static_cast<unsigned long>(
+              candidateProbeElapsedMs == 0
+                  ? 0
+                  : (static_cast<uint64_t>(candidateProbeBytes) * 1000ULL /
+                     candidateProbeElapsedMs / 1024ULL)));
+      break;
+    }
+    Serial.printf(
+        "WARN: SD transfer probe mismatch at %lu Hz; trying safer speed\n",
+        static_cast<unsigned long>(frequency));
+  }
+
+  gSdReady = mounted;
+  unlockSd();
+  return mounted;
+}
+
+void leaveTransferStorageMode() {
+  if (gSdReady && gSdCurrentSpiFrequency == kSdSpiFrequency) return;
+  if (!lockSd(pdMS_TO_TICKS(5000))) {
+    Serial.println("WARN: could not restore recording SD speed");
+    return;
+  }
+  gSdReady = remountSdAtFrequency(kSdSpiFrequency);
+  unlockSd();
+  Serial.printf(
+      "SD recording mode restored: freq=%lu Hz ready=%s\n",
+      static_cast<unsigned long>(kSdSpiFrequency),
+      gSdReady ? "true" : "false");
 }
 
 bool setupI2SMicrophone() {
@@ -1262,21 +1480,29 @@ bool setupGpsModule() {
   gGpsBaudIndex = 0;
   gGpsSerial.begin(kGpsBaudRates[gGpsBaudIndex], SERIAL_8N1, kGpsRxPin, kGpsTxPin);
   gLastGpsBaudSwitchMs = millis();
-  Serial.printf("GPS UART ready: RX=%d TX=%d baud=%lu\n", kGpsRxPin, kGpsTxPin,
-                static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
-  Serial.println("GPS module will stay active and keep searching until first fix");
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf("GPS UART ready: RX=%d TX=%d baud=%lu\n", kGpsRxPin, kGpsTxPin,
+                  static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
+    Serial.println("GPS module will stay active and keep searching until first fix");
+  }
   return true;
 }
 
 void stopRecording(const char *reason) {
-  if (gRecordingFile && lockSd(pdMS_TO_TICKS(1000))) {
-    writeWavHeader(gRecordingFile, gRecordingDataBytes);
-    gRecordingFile.close();
+  // Stop the recording task from beginning another SD write while the main
+  // loop waits to finalize the WAV file.
+  gState = RecorderState::Stopped;
+  gConnectivity.setRecordingActive(false);
+
+  if (!gRecordingPath.isEmpty() && lockSd(pdMS_TO_TICKS(1000))) {
+    if (!finalizeRecordingFile()) {
+      Serial.printf("ERROR: failed to finalize WAV header for %s\n",
+                    gRecordingPath.c_str());
+    }
     unlockSd();
   }
 
-  gState = RecorderState::Stopped;
-  gProblemIndicatorEnabled = true;
+  gProblemIndicatorEnabled = false;
   gLastProblemIndicatorMs = millis();
   logBuzzerPatternRequest("recording_stopped", 1, 40, 0);
   startBuzzerPattern(1, 40, 0);
@@ -1297,8 +1523,6 @@ bool startRecording() {
     return false;
   }
 
-  clearPreviousRecordingFiles();
-
   gRecordingPath = allocateRecordingPath();
   if (gRecordingPath.isEmpty()) {
     Serial.println("ERROR: no free recording filename available");
@@ -1313,12 +1537,6 @@ bool startRecording() {
   gRecordingFile = SD.open(gRecordingPath.c_str(), FILE_WRITE);
   if (!gRecordingFile) {
     Serial.printf("WARN: failed to open %s with FILE_WRITE\n", gRecordingPath.c_str());
-
-    // Fallback to a short fixed filename in case the filesystem or library is
-    // unhappy with the generated path or create mode.
-    gRecordingPath = "/REC00001.WAV";
-    SD.remove(gRecordingPath.c_str());
-    gRecordingFile = SD.open(gRecordingPath.c_str(), FILE_WRITE);
   }
 
   if (!gRecordingFile) {
@@ -1340,6 +1558,8 @@ bool startRecording() {
   gGpsFixBeepPlayed = false;
   gFirstFixMetadataWritten = false;
   gRecordingGpsPointIndex = 0;
+  gRecordingPublishedForTransfer = false;
+  gConnectivity.setRecordingUnavailable();
   gHighPassPrevInput = 0.0f;
   gHighPassPrevOutput = 0.0f;
   gLowPassPrevOutput = 0.0f;
@@ -1358,6 +1578,7 @@ bool startRecording() {
   writeRecordingMetadata();
   appendGpsHistoryEntry("recording_started");
   gState = RecorderState::Recording;
+  gConnectivity.setRecordingActive(true);
   gProblemIndicatorEnabled = false;
   logBuzzerPatternRequest("recording_started", 2, 120, 120);
   startBuzzerPattern(2, 120, 120);
@@ -1368,13 +1589,13 @@ bool startRecording() {
 }
 
 void failRecorder(const char *message) {
-  if (gRecordingFile && lockSd(pdMS_TO_TICKS(1000))) {
-    writeWavHeader(gRecordingFile, gRecordingDataBytes);
-    gRecordingFile.close();
+  if (!gRecordingPath.isEmpty() && lockSd(pdMS_TO_TICKS(1000))) {
+    finalizeRecordingFile();
     unlockSd();
   }
   Serial.printf("FATAL: %s\n", message);
   gState = RecorderState::Error;
+  gConnectivity.setRecordingActive(false);
   gProblemIndicatorEnabled = true;
   gLastProblemIndicatorMs = millis();
   logBuzzerPatternRequest(message, 1, 40, 0);
@@ -1434,14 +1655,11 @@ void processRecording() {
 
   const uint32_t now = millis();
   if (now - gLastRecordingProgressLogMs >= kRecordingProgressLogIntervalMs) {
-    Serial.printf("Recorder alive: bytes=%lu last_gps_state=%s gps_chars=%lu start_utc=%s sd_retry_events=%lu sd_retry_attempts=%lu sd_failures=%lu\n",
-                  static_cast<unsigned long>(gRecordingDataBytes),
-                  gpsStateLabel(),
-                  static_cast<unsigned long>(gTinyGps.charsProcessed()),
-                  gRecordingStartUtcResolved ? gRecordingStartUtcIso.c_str() : "pending_gps_fix",
-                  static_cast<unsigned long>(gSdRecoveredWriteEvents),
-                  static_cast<unsigned long>(gSdRecoveredWriteAttempts),
-                  static_cast<unsigned long>(gSdWriteFailureEvents));
+    // Serial.printf("Recorder alive: bytes=%lu sd_retry_events=%lu sd_retry_attempts=%lu sd_failures=%lu\n",
+    //               static_cast<unsigned long>(gRecordingDataBytes),
+    //               static_cast<unsigned long>(gSdRecoveredWriteEvents),
+    //               static_cast<unsigned long>(gSdRecoveredWriteAttempts),
+    //               static_cast<unsigned long>(gSdWriteFailureEvents));
     gLastRecordingProgressLogMs = now;
     gSdRecoveredWriteEvents = 0;
     gSdRecoveredWriteAttempts = 0;
@@ -1468,6 +1686,10 @@ void processRecording() {
     failRecorder("Timed out waiting for SD access");
     return;
   }
+  if (gState != RecorderState::Recording) {
+    unlockSd();
+    return;
+  }
 
   const uint8_t *writePtr = reinterpret_cast<const uint8_t *>(pcmSamples);
   size_t totalWritten = 0;
@@ -1485,6 +1707,9 @@ void processRecording() {
     writeAttempts++;
     neededRetry = true;
     delay(kSdWriteRetryDelayMs);
+    if (!reopenRecordingFileForWrite(gRecordingDataBytes + totalWritten)) {
+      continue;
+    }
   }
 
   const uint32_t writeElapsedMs = millis() - writeStartMs;
@@ -1517,8 +1742,8 @@ void processRecording() {
                     static_cast<unsigned long>(gRecordingDataBytes));
     } else {
       gLastHeaderSyncMs = now;
-      Serial.printf("WAV checkpoint saved: data_bytes=%lu\n",
-                    static_cast<unsigned long>(gRecordingDataBytes));
+      // Serial.printf("WAV checkpoint saved: data_bytes=%lu\n",
+      //               static_cast<unsigned long>(gRecordingDataBytes));
     }
   }
 
@@ -1561,15 +1786,31 @@ void setup() {
 
   Serial.println();
   Serial.println("ESP32 INMP441 recorder booting...");
-  Serial.printf("Firmware build: GPS-TICK-NONBLOCK %s %s\n", __DATE__, __TIME__);
-  Serial.printf("Startup delay: %lu ms\n", static_cast<unsigned long>(kStartupDelayMs));
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.printf(
+      "Previous reset: reason=%s code=%d free_heap=%lu "
+      "min_free_heap=%lu\n",
+      resetReasonLabel(resetReason),
+      static_cast<int>(resetReason),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()));
+  Serial.printf("NearNest firmware: version=%s protocol=2 serial=%s hardware=%s build=%s %s\n",
+                NEARNEST_FIRMWARE_VERSION,
+                NEARNEST_DEVICE_SERIAL,
+                NEARNEST_HARDWARE_REVISION,
+                __DATE__,
+                __TIME__);
   Serial.printf("Mic pins: BCLK=%d WS=%d SD=%d\n", kI2sBclkPin, kI2sWsPin, kI2sDataInPin);
   Serial.printf("SD pins: CS=%d SCK=%d MISO=%d MOSI=%d\n", kSdCsPin, kSdSckPin, kSdMisoPin, kSdMosiPin);
   Serial.printf("Buzzer pin: %d\n", kBuzzerPin);
-  Serial.printf("GPS pins: RX=%d TX=%d baud=%lu\n", kGpsRxPin, kGpsTxPin,
-                static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
+  if (kGpsSerialLogsEnabled) {
+    Serial.printf("GPS pins: RX=%d TX=%d baud=%lu\n", kGpsRxPin, kGpsTxPin,
+                  static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
+  }
 
   setupHardware();
+  gConnectivity.begin(
+      SD, gSdMutex, enterTransferStorageMode, leaveTransferStorageMode);
   xTaskCreatePinnedToCore(recordingTaskMain, "recordingTask", 6144, nullptr, 1, &gRecordingTaskHandle, 1);
   if (!gRecordingTaskHandle) {
     Serial.println("ERROR: failed to create recording task");
@@ -1580,38 +1821,54 @@ void setup() {
 }
 
 void loop() {
+  gConnectivity.service();
   serviceBuzzer();
   serviceGps();
+
+  if (gConnectivity.consumeStopRecordingRequest() &&
+      gState == RecorderState::Recording) {
+    stopRecording("sync requested");
+  }
+
+  if (gConnectivity.consumeStartRecordingRequest()) {
+    if (gState == RecorderState::Stopped) {
+      if (startRecording()) {
+        gConnectivity.publishStatus("{\"event\":\"recording.started\"}");
+      } else {
+        gConnectivity.publishError(
+            "recording.start_failed", "Could not start a new recording");
+      }
+    } else if (gState == RecorderState::Recording) {
+      gConnectivity.publishStatus("{\"event\":\"recording.started\"}");
+    } else {
+      gConnectivity.publishError(
+          "recording.start_unavailable", "Recorder is not ready to start");
+    }
+  }
+
+  if (gState == RecorderState::Stopped &&
+      !gRecordingPublishedForTransfer &&
+      !gRecordingPath.isEmpty()) {
+    const uint64_t finalizedSize =
+        static_cast<uint64_t>(sizeof(WavHeader)) + gRecordingDataBytes;
+    const String fileName =
+        gRecordingPath.substring(gRecordingPath.lastIndexOf('/') + 1);
+    const String recordingId = String("sd-") + fileName;
+    gConnectivity.setRecordingAvailable(
+        gRecordingPath, recordingId, finalizedSize);
+    gRecordingPublishedForTransfer = true;
+  }
 
   if (gState == RecorderState::Error || gState == RecorderState::Stopped) {
     if (gProblemIndicatorEnabled && !gBuzzerActive) {
       const uint32_t now = millis();
       if (gLastProblemIndicatorMs == 0 ||
           (now - gLastProblemIndicatorMs) >= kProblemIndicatorIntervalMs) {
-        logBuzzerPatternRequest("problem_indicator", 1, 40, 0);
         startBuzzerPattern(1, 40, 0);
         gLastProblemIndicatorMs = now;
       }
     }
     delay(10);
-    return;
-  }
-
-  if (gState == RecorderState::WaitingToStart) {
-    const uint32_t elapsed = millis();
-    if (elapsed >= kStartupDelayMs) {
-      if (!startRecording()) {
-        gState = RecorderState::Stopped;
-        gProblemIndicatorEnabled = true;
-        gLastProblemIndicatorMs = millis();
-        Serial.println("Recorder idle. Fix the reported hardware/storage issue and reset ESP32 to try again.");
-        logBuzzerPatternRequest("recorder_idle_after_start_failure", 1, 40, 0);
-        startBuzzerPattern(1, 40, 0);
-      }
-      return;
-    }
-
-    delay(5);
     return;
   }
 

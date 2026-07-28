@@ -14,6 +14,20 @@ import type {
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/v1';
+const AUTH_STORAGE_KEY = 'kid-audio-auth-session';
+let sessionInFlight: Promise<AuthTokens> | null = null;
+
+interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+interface AuthEnvelope {
+  data: {
+    tokens: AuthTokens;
+  };
+  success: true;
+}
 
 interface CreateAnalysisInput {
   childId: string;
@@ -28,13 +42,24 @@ async function apiRequest<T>(
   tenantId: string,
   init?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  let tokens = await getDevelopmentSession(tenantId);
+  let response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
-      'x-tenant-id': tenantId,
+      authorization: `Bearer ${tokens.accessToken}`,
       ...init?.headers,
     },
   });
+  if (response.status === 401) {
+    tokens = await rotateDevelopmentSession(tokens.refreshToken, tenantId);
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${tokens.accessToken}`,
+        ...init?.headers,
+      },
+    });
+  }
   if (!response.ok) {
     let message = `Request failed with status ${response.status}`;
     try {
@@ -46,6 +71,104 @@ async function apiRequest<T>(
     throw new Error(message);
   }
   return response.json() as Promise<T>;
+}
+
+async function getDevelopmentSession(tenantId: string): Promise<AuthTokens> {
+  const stored = window.localStorage.getItem(AUTH_STORAGE_KEY);
+  if (stored) {
+    try {
+      return (JSON.parse(stored) as { tokens: AuthTokens }).tokens;
+    } catch {
+      window.localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  }
+  if (!sessionInFlight) {
+    sessionInFlight = createDevelopmentSession(tenantId).finally(() => {
+      sessionInFlight = null;
+    });
+  }
+  return sessionInFlight;
+}
+
+async function rotateDevelopmentSession(
+  refreshToken: string,
+  tenantId: string,
+): Promise<AuthTokens> {
+  if (!sessionInFlight) {
+    sessionInFlight = refreshDevelopmentSession(refreshToken)
+      .catch(() => createDevelopmentSession(tenantId))
+      .finally(() => {
+        sessionInFlight = null;
+      });
+  }
+  return sessionInFlight;
+}
+
+async function createDevelopmentSession(
+  tenantId: string,
+): Promise<AuthTokens> {
+  const phoneNumber = developmentPhoneNumber(tenantId);
+  const sent = await fetch(`${API_BASE_URL}/auth/otp/send`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      channel: 'phone',
+      phone: {
+        countryCode: '+91',
+        number: phoneNumber,
+      },
+    }),
+  });
+  if (!sent.ok) {
+    throw new Error('Unable to start the local development session');
+  }
+  const sentPayload = (await sent.json()) as {
+    data: { developmentCode?: string; verificationId: string };
+  };
+  const verified = await fetch(`${API_BASE_URL}/auth/otp/verify`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      verificationId: sentPayload.data.verificationId,
+      code: sentPayload.data.developmentCode ?? '1234',
+    }),
+  });
+  if (!verified.ok) {
+    throw new Error('Unable to verify the local development session');
+  }
+  const session = (await verified.json()) as AuthEnvelope;
+  window.localStorage.setItem(
+    AUTH_STORAGE_KEY,
+    JSON.stringify(session.data),
+  );
+  return session.data.tokens;
+}
+
+async function refreshDevelopmentSession(
+  refreshToken: string,
+): Promise<AuthTokens> {
+  const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ refreshToken }),
+  });
+  if (!response.ok) {
+    throw new Error('Development session expired');
+  }
+  const session = (await response.json()) as AuthEnvelope;
+  window.localStorage.setItem(
+    AUTH_STORAGE_KEY,
+    JSON.stringify(session.data),
+  );
+  return session.data.tokens;
+}
+
+function developmentPhoneNumber(seed: string): string {
+  let hash = 0;
+  for (const character of seed) {
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  }
+  return `9${String(hash).padStart(9, '0').slice(-9)}`;
 }
 
 export function createAnalysis(

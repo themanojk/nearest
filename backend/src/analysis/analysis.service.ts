@@ -1,6 +1,7 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -41,6 +42,8 @@ import {
   DetectAcousticEventsJob,
   AggregateRiskJob,
   RiskIncidentPageResponse,
+  MultipartPartsResponse,
+  MultipartUploadStatusResponse,
 } from './analysis.types';
 import { CreateAnalysisDto } from './dto/create-analysis.dto';
 import { ListAnalysesDto } from './dto/list-analyses.dto';
@@ -54,9 +57,11 @@ import {
   AnalysisJob,
   AnalysisJobDocument,
   AnalysisStatus,
+  AudioUploadMode,
   PipelineStageStatus,
   TranscriptionLanguageMode,
 } from './schemas/analysis-job.schema';
+import { CreateMultipartPartsDto } from './dto/create-multipart-parts.dto';
 import {
   ScanSegment,
   ScanSegmentDocument,
@@ -81,6 +86,9 @@ import {
   RiskIncident,
   RiskIncidentDocument,
 } from './schemas/risk-incident.schema';
+
+const MULTIPART_PART_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_MULTIPART_PARTS = 10_000;
 
 @Injectable()
 export class AnalysisService {
@@ -131,6 +139,19 @@ export class AnalysisService {
 
     const analysisId = new Types.ObjectId();
     const objectKey = `${tenantId}/${analysisId.toHexString()}/source`;
+    const uploadMode = input.uploadMode ?? AudioUploadMode.Single;
+    const multipartPartCount =
+      uploadMode === AudioUploadMode.Multipart
+        ? Math.ceil(input.sizeBytes / MULTIPART_PART_SIZE_BYTES)
+        : undefined;
+    if (
+      multipartPartCount !== undefined &&
+      multipartPartCount > MAX_MULTIPART_PARTS
+    ) {
+      throw new PayloadTooLargeException(
+        'Audio requires too many multipart upload chunks',
+      );
+    }
     const document = await this.analysisModel.create({
       _id: analysisId,
       tenantId,
@@ -139,6 +160,12 @@ export class AnalysisService {
       originalFileName: input.fileName,
       contentType: input.contentType,
       sizeBytes: input.sizeBytes,
+      uploadMode,
+      multipartPartCount,
+      multipartPartSizeBytes:
+        uploadMode === AudioUploadMode.Multipart
+          ? MULTIPART_PART_SIZE_BYTES
+          : undefined,
       transcriptionLanguageMode:
         input.transcriptionLanguageMode ?? TranscriptionLanguageMode.Auto,
       status: AnalysisStatus.AwaitingUpload,
@@ -146,10 +173,25 @@ export class AnalysisService {
     });
 
     try {
-      const upload = await this.storage.createUploadUrl(
-        objectKey,
-        input.contentType,
-      );
+      if (uploadMode === AudioUploadMode.Multipart) {
+        const multipartUploadId = await this.storage.createMultipartUpload(
+          objectKey,
+          input.contentType,
+        );
+        document.multipartUploadId = multipartUploadId;
+        await document.save();
+        this.logger.log(
+          `analysis.multipart_created analysisId=${analysisId.toString()} sizeBytes=${input.sizeBytes} partCount=${multipartPartCount}`,
+        );
+        return {
+          ...this.toResponse(document),
+          multipart: {
+            partCount: multipartPartCount!,
+            partSizeBytes: MULTIPART_PART_SIZE_BYTES,
+          },
+        };
+      }
+      const upload = await this.storage.createUploadUrl(objectKey, input.contentType);
       this.logger.log(
         `analysis.created analysisId=${analysisId.toString()} sizeBytes=${input.sizeBytes} contentType=${input.contentType}`,
       );
@@ -164,6 +206,108 @@ export class AnalysisService {
       );
       throw error;
     }
+  }
+
+  async createMultipartPartUrls(
+    tenantId: string,
+    analysisId: string,
+    input: CreateMultipartPartsDto,
+  ): Promise<MultipartPartsResponse> {
+    const document = await this.findMultipartDocument(tenantId, analysisId);
+    const partCount = document.multipartPartCount!;
+    const partNumbers = [...new Set(input.partNumbers)].sort(
+      (left, right) => left - right,
+    );
+    if (partNumbers.some((partNumber) => partNumber > partCount)) {
+      throw new BadRequestException('Multipart part number is out of range');
+    }
+    return {
+      parts: await Promise.all(
+        partNumbers.map((partNumber) =>
+          this.storage.createMultipartPartUrl(
+            document.sourceObjectKey,
+            document.multipartUploadId!,
+            partNumber,
+          ),
+        ),
+      ),
+    };
+  }
+
+  async getMultipartStatus(
+    tenantId: string,
+    analysisId: string,
+  ): Promise<MultipartUploadStatusResponse> {
+    const document = await this.findMultipartDocument(tenantId, analysisId);
+    const completedParts = await this.storage.listMultipartParts(
+      document.sourceObjectKey,
+      document.multipartUploadId!,
+    );
+    return {
+      sizeBytes: document.sizeBytes,
+      partSizeBytes: document.multipartPartSizeBytes!,
+      partCount: document.multipartPartCount!,
+      completedParts,
+      completedBytes: completedParts.reduce(
+        (total, part) => total + part.sizeBytes,
+        0,
+      ),
+    };
+  }
+
+  async completeMultipartUpload(
+    tenantId: string,
+    analysisId: string,
+  ): Promise<AnalysisResponse> {
+    const document = await this.findMultipartDocument(tenantId, analysisId);
+    const parts = await this.storage.listMultipartParts(
+      document.sourceObjectKey,
+      document.multipartUploadId!,
+    );
+    const expectedCount = document.multipartPartCount!;
+    const expectedNumbers = Array.from(
+      { length: expectedCount },
+      (_, index) => index + 1,
+    );
+    if (
+      parts.length !== expectedCount ||
+      parts.some(
+        (part, index) => part.partNumber !== expectedNumbers[index],
+      ) ||
+      parts.reduce((total, part) => total + part.sizeBytes, 0) !==
+        document.sizeBytes
+    ) {
+      throw new ConflictException(
+        'Multipart upload is incomplete or has an invalid size',
+      );
+    }
+    await this.storage.completeMultipartUpload(
+      document.sourceObjectKey,
+      document.multipartUploadId!,
+      parts,
+    );
+    document.multipartUploadId = undefined;
+    await document.save();
+    this.logger.log(
+      `analysis.multipart_completed analysisId=${analysisId} parts=${parts.length} sizeBytes=${document.sizeBytes}`,
+    );
+    return this.completeUpload(tenantId, analysisId);
+  }
+
+  async abortMultipartUpload(
+    tenantId: string,
+    analysisId: string,
+  ): Promise<AnalysisResponse> {
+    const document = await this.findMultipartDocument(tenantId, analysisId);
+    await this.storage.abortMultipartUpload(
+      document.sourceObjectKey,
+      document.multipartUploadId!,
+    );
+    document.multipartUploadId = undefined;
+    document.status = AnalysisStatus.Failed;
+    document.failureReason = 'Multipart upload cancelled';
+    await document.save();
+    return this.toResponse(document);
   }
 
   async completeUpload(
@@ -772,8 +916,27 @@ export class AnalysisService {
 
   private assertTenantId(tenantId: string): void {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(tenantId)) {
-      throw new BadRequestException('Invalid x-tenant-id header');
+      throw new BadRequestException('Invalid authenticated parent identifier');
     }
+  }
+
+  private async findMultipartDocument(
+    tenantId: string,
+    analysisId: string,
+  ): Promise<AnalysisJobDocument> {
+    const document = await this.findDocument(tenantId, analysisId);
+    if (
+      document.uploadMode !== AudioUploadMode.Multipart ||
+      !document.multipartUploadId ||
+      !document.multipartPartCount ||
+      !document.multipartPartSizeBytes
+    ) {
+      throw new ConflictException('Analysis has no active multipart upload');
+    }
+    if (document.status !== AnalysisStatus.AwaitingUpload) {
+      throw new ConflictException('Analysis is not awaiting an upload');
+    }
+    return document;
   }
 
   private toResponse(document: AnalysisJobDocument): AnalysisResponse {
@@ -825,6 +988,7 @@ export class AnalysisService {
       sizeBytes: document.sizeBytes,
       status: document.status,
       updatedAt: document.updatedAt,
+      uploadMode: document.uploadMode ?? AudioUploadMode.Single,
     };
   }
 

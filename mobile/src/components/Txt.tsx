@@ -15,24 +15,16 @@ type Props = TextProps & {
   style?: TextStyle | TextStyle[];
 };
 
-// The static Work Sans Medium/SemiBold files register under their own family
-// names, which the new-architecture text layer does not resolve reliably.
-// Route every Work Sans weight through the base "Work Sans" family (proven to
-// load) plus an explicit numeric fontWeight instead.
+// Each weight maps to its own real font file (referenced by basename so it
+// resolves on both iOS and Android). Because the file already is the right
+// weight, do NOT also set fontWeight — on Android that makes it hunt for a
+// non-existent "<family>_bold" asset and fall back to the system font.
 const family: Record<Weight, string> = {
   regular: fonts.regular,
-  medium: fonts.regular,
-  semibold: fonts.regular,
-  bold: fonts.regular,
+  medium: fonts.medium,
+  semibold: fonts.semibold,
+  bold: fonts.bold,
   serif: fonts.serif,
-};
-
-const weightValue: Record<Weight, TextStyle['fontWeight'] | undefined> = {
-  regular: '400',
-  medium: '500',
-  semibold: '600',
-  bold: '700',
-  serif: undefined,
 };
 
 /** App text primitive — applies the correct static font family per weight. */
@@ -52,7 +44,6 @@ export default function Txt({
     fontFamily: family[weight],
     fontSize: size,
     color,
-    ...(weightValue[weight] ? { fontWeight: weightValue[weight] } : null),
     ...(lh != null ? { lineHeight: lh } : null),
     ...(ls != null ? { letterSpacing: ls } : null),
     ...(center ? { textAlign: 'center' } : null),

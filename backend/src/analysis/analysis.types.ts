@@ -1,5 +1,6 @@
 import {
   AnalysisStatus,
+  AudioUploadMode,
   MediaMetadata,
   PipelineStageProgress,
   TranscriptionLanguageMode,
@@ -45,6 +46,7 @@ export interface AnalysisResponse {
   sizeBytes: number;
   status: AnalysisStatus;
   updatedAt: Date;
+  uploadMode: AudioUploadMode;
 }
 
 export interface AnalysisPageResponse {
@@ -315,12 +317,37 @@ export interface TranscriptionSummary {
 }
 
 export interface CreateAnalysisResponse extends AnalysisResponse {
-  upload: {
+  upload?: {
     expiresAt: Date;
     headers: Record<string, string>;
     method: 'PUT';
     url: string;
   };
+  multipart?: {
+    partCount: number;
+    partSizeBytes: number;
+  };
+}
+
+export interface MultipartPartsResponse {
+  parts: Array<{
+    expiresAt: Date;
+    method: 'PUT';
+    partNumber: number;
+    url: string;
+  }>;
+}
+
+export interface MultipartUploadStatusResponse {
+  completedBytes: number;
+  completedParts: Array<{
+    etag: string;
+    partNumber: number;
+    sizeBytes: number;
+  }>;
+  partCount: number;
+  partSizeBytes: number;
+  sizeBytes: number;
 }
 
 export interface SegmentResponse {

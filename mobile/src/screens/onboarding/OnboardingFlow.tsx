@@ -4,11 +4,18 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, radii, spacing, shadows } from '../../theme/theme';
 import { useStore } from '../../state/store';
 import { transport } from '../../services/transport';
+import {
+  completePairingSession,
+  createChildProfile,
+  discoverPairingDevice,
+  listOwnedDevices,
+  startPairingSession,
+  verifyPairingDevice,
+} from '../../services/devices';
 import { DEVICE_DEFAULTS, PLAN } from '../../state/seed';
 import Txt from '../../components/Txt';
 import Glass from '../../components/Glass';
 import Icon from '../../components/Icon';
-import BrandMark from '../../components/BrandMark';
 import ChildrenIllustration from '../../components/ChildrenIllustration';
 import { PrimaryButton, GhostButton } from '../../components/Buttons';
 import ProgressDots from './ProgressDots';
@@ -21,21 +28,117 @@ const DISCLOSURES = [
 ];
 
 export default function OnboardingFlow() {
-  const { state, patch } = useStore();
+  const { state, patch, completeOnboarding } = useStore();
   const insets = useSafeAreaInsets();
   const step = state.onboardStep;
 
   const go = useCallback((s: number) => patch({ onboardStep: s }), [patch]);
 
   const startPairing = useCallback(async () => {
-    patch({ pairingSearching: true });
+    patch({ pairingSearching: true, pairingError: null });
     try {
-      await transport.scanAndPair();
-      patch({ pairingSearching: false, onboardStep: 4 });
-    } catch {
-      patch({ pairingSearching: false });
+      const scanned = await transport.scanAndPair();
+      if (scanned.trust === 'simulated') {
+        patch({
+          pairedDeviceCode: scanned.code,
+          pairingSearching: false,
+          onboardStep: 4,
+        });
+        return;
+      }
+
+      const existingDevice = (await listOwnedDevices()).find(
+        (device) =>
+          device.serialNumber === scanned.serialNumber &&
+          device.pairingStatus === 'paired' &&
+          device.lifecycleStatus === 'active',
+      );
+      if (existingDevice) {
+        patch({
+          pairedDeviceCode: scanned.code,
+          pairingSearching: false,
+        });
+        completeOnboarding();
+        return;
+      }
+
+      const started = await startPairingSession();
+      const discovered = await discoverPairingDevice(
+        started.id,
+        scanned.serialNumber,
+      );
+      if (!discovered.challenge) {
+        throw new Error('The server did not issue a device challenge');
+      }
+      const signature = await transport.signPairingChallenge(
+        discovered.challenge.payload,
+      );
+      await verifyPairingDevice(
+        started.id,
+        discovered.challenge.challengeId,
+        signature,
+      );
+      patch({
+        pairedDeviceCode: scanned.code,
+        pairingSessionId: started.id,
+        pairingSearching: false,
+        onboardStep: 4,
+      });
+    } catch (error) {
+      patch({
+        pairingSearching: false,
+        pairingError:
+          error instanceof Error ? error.message : 'Pairing could not be completed',
+      });
     }
-  }, [patch]);
+  }, [completeOnboarding, patch]);
+
+  const saveSetup = useCallback(async () => {
+    const nickname = state.childNicknameInput.trim();
+    const deviceName = state.deviceNameInput.trim();
+    if (!nickname || !deviceName) {
+      patch({
+        pairingError: 'Device name and child nickname are required',
+      });
+      return;
+    }
+    patch({ setupSaving: true, pairingError: null });
+    try {
+      let childId = state.onboardingChildId;
+      if (!childId) {
+        const child = await createChildProfile(nickname);
+        childId = child.id;
+        // Preserve the created child across a retry if pairing completion
+        // fails after this request succeeds.
+        patch({ onboardingChildId: childId });
+      }
+      if (state.pairingSessionId) {
+        await completePairingSession(
+          state.pairingSessionId,
+          childId,
+          deviceName,
+        );
+      }
+      patch({
+        onboardingChildId: childId,
+        setupSaving: false,
+        onboardStep: 6,
+        wifiPasswordInput: '',
+      });
+    } catch (error) {
+      patch({
+        setupSaving: false,
+        pairingError:
+          error instanceof Error ? error.message : 'Device setup could not be saved',
+      });
+    }
+  }, [
+    patch,
+    state.childNicknameInput,
+    state.deviceNameInput,
+    state.onboardingChildId,
+    state.pairingSessionId,
+  ]);
 
   const topPad = insets.top + 8;
   const bottomPad = insets.bottom + 8;
@@ -72,7 +175,10 @@ export default function OnboardingFlow() {
         </View>
         <View style={{ flex: 1 }} />
         <View style={{ paddingHorizontal: spacing.onboardGutter }}>
-          <PrimaryButton label="Get started" onPress={() => go(1)} />
+          <PrimaryButton
+            label="Get started"
+            onPress={() => (state.authedPhone ? go(1) : patch({ phase: 'auth' }))}
+          />
         </View>
         <ProgressDots step={0} />
       </View>
@@ -163,7 +269,7 @@ export default function OnboardingFlow() {
       <StepScaffold
         step={3}
         title="Pair the device"
-        body="Press and hold the button on the device for 3 seconds until the light pulses."
+        body="Keep the wearable nearby. Android will ask for the six-digit Bluetooth code printed on its label."
         primaryLabel={searching ? 'Searching…' : 'Start pairing'}
         primaryDisabled={searching}
         onPrimary={startPairing}>
@@ -212,6 +318,11 @@ export default function OnboardingFlow() {
             {searching ? 'Searching for device…' : 'Waiting to start'}
           </Txt>
         </View>
+        {state.pairingError && (
+          <Txt size={12.5} color={colors.destructive} center>
+            {state.pairingError}
+          </Txt>
+        )}
       </StepScaffold>
     );
   }
@@ -222,7 +333,7 @@ export default function OnboardingFlow() {
       <StepScaffold
         step={4}
         title="Device found"
-        body="Confirm this code matches the light pattern on your device."
+        body="Confirm the final two digits match the Bluetooth code printed on the wearable label."
         primaryLabel="Confirm match"
         onPrimary={() => go(5)}>
         <IconTile size={64} radius={16}>
@@ -237,7 +348,7 @@ export default function OnboardingFlow() {
             paddingHorizontal: 20,
           }}>
           <Txt weight="serif" size={26} color={colors.primaryGreenDark} ls={3}>
-            NN · 7734
+            {state.pairedDeviceCode ?? 'NN · ----'}
           </Txt>
         </View>
       </StepScaffold>
@@ -264,14 +375,34 @@ export default function OnboardingFlow() {
             value={state.childNicknameInput}
             onChangeText={(t) => patch({ childNicknameInput: t })}
           />
+          <Glass style={{ padding: 14 }}>
+            <Txt size={13} color={colors.body} lh={19}>
+              The wearable does not join your home Wi-Fi or access the
+              internet. During sync it creates a temporary private network for
+              this phone.
+            </Txt>
+          </Glass>
           <Field label="Time zone" value={DEVICE_DEFAULTS.timeZone} readOnly />
         </ScrollView>
         <View style={{ flexDirection: 'row', gap: 12, paddingHorizontal: spacing.lg, paddingTop: 8 }}>
           <GhostButton label="Back" onPress={() => go(4)} />
           <View style={{ flex: 1 }}>
-            <PrimaryButton label="Continue" onPress={() => go(6)} />
+            <PrimaryButton
+              label={state.setupSaving ? 'Saving…' : 'Continue'}
+              disabled={state.setupSaving}
+              onPress={saveSetup}
+            />
           </View>
         </View>
+        {state.pairingError && (
+          <Txt
+            size={12.5}
+            color={colors.destructive}
+            center
+            style={{ paddingHorizontal: spacing.lg, paddingTop: 8 }}>
+            {state.pairingError}
+          </Txt>
+        )}
         <ProgressDots step={5} />
       </View>
     );
@@ -322,7 +453,7 @@ export default function OnboardingFlow() {
       <View style={{ paddingHorizontal: spacing.lg, paddingTop: 8 }}>
         <PrimaryButton
           label="Start free trial"
-          onPress={() => patch({ phase: 'app', activeTab: 'today' })}
+          onPress={completeOnboarding}
         />
       </View>
       <ProgressDots step={6} />
@@ -408,11 +539,15 @@ function Field({
   value,
   onChangeText,
   readOnly,
+  secureTextEntry,
+  autoCapitalize,
 }: {
+  autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
   label: string;
   value: string;
   onChangeText?: (t: string) => void;
   readOnly?: boolean;
+  secureTextEntry?: boolean;
 }) {
   return (
     <View style={{ gap: 6 }}>
@@ -423,6 +558,8 @@ function Field({
         value={value}
         onChangeText={onChangeText}
         editable={!readOnly}
+        secureTextEntry={secureTextEntry}
+        autoCapitalize={autoCapitalize}
         style={{
           backgroundColor: colors.glassFieldBg,
           borderWidth: 1,
@@ -431,7 +568,7 @@ function Field({
           paddingHorizontal: 13,
           paddingVertical: 12,
           fontSize: 14,
-          fontFamily: 'Work Sans',
+          fontFamily: 'WorkSans-Regular',
           color: readOnly ? colors.muted : colors.ink,
         }}
       />

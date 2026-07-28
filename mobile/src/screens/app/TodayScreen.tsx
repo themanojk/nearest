@@ -1,13 +1,13 @@
-import React from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { View, ScrollView, Pressable } from 'react-native';
 import { colors, radii, spacing } from '../../theme/theme';
 import { useAllowance, useStore } from '../../state/store';
-import { ALLOWANCE } from '../../state/seed';
 import Glass from '../../components/Glass';
 import Txt from '../../components/Txt';
 import Chip from '../../components/Chip';
 import ProgressBar from '../../components/ProgressBar';
 import EventRow from '../../components/EventRow';
+import { transport } from '../../services/transport';
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
@@ -25,6 +25,24 @@ function Stat({ label, value }: { label: string; value: string }) {
 export default function TodayScreen() {
   const { state, patch, reports, restoreSample } = useStore();
   const { used, total, remaining, resets } = useAllowance();
+  const refreshTelemetry = useCallback(async () => {
+    try {
+      const telemetry = await transport.getDeviceTelemetry();
+      patch({
+        deviceBattery: telemetry.batteryPercent,
+        deviceStorage: Math.round(
+          (telemetry.storageUsedBytes / telemetry.storageTotalBytes) * 100,
+        ),
+      });
+    } catch {
+      // Preserve the last successful reading while the wearable is out of
+      // range. The next screen visit retries the BLE telemetry request.
+    }
+  }, [patch]);
+
+  useEffect(() => {
+    void refreshTelemetry();
+  }, [refreshTelemetry]);
 
   const todayReport = reports.find((r) => r.isToday);
 
@@ -53,8 +71,22 @@ export default function TodayScreen() {
           <Chip label="Nearby" bg={colors.tintChip} color={colors.statusGreen} />
         </View>
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', columnGap: 20, rowGap: 6 }}>
-          <Stat label="Battery" value={`${state.deviceBattery}%`} />
-          <Stat label="Storage" value={`${state.deviceStorage}%`} />
+          <Stat
+            label="Battery"
+            value={
+              state.deviceBattery === null
+                ? '—'
+                : `${state.deviceBattery}%`
+            }
+          />
+          <Stat
+            label="Storage"
+            value={
+              state.deviceStorage === null
+                ? '—'
+                : `${state.deviceStorage}%`
+            }
+          />
           <Stat label="" value={`${remaining}/${total} syncs`} />
         </View>
         <Txt size={11} color={colors.muted}>

@@ -26,3 +26,5 @@ data/
 tmp/
 *.log
 workers/models/**/*.onnx
+NearNestFirmware/device_secrets.h
+NearNestFirmware/*.public.pem

@@ -1,11 +1,16 @@
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   CreateBucketCommand,
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListPartsCommand,
   PutBucketCorsCommand,
   PutObjectCommand,
   S3Client,
+  UploadPartCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import {
@@ -32,10 +37,24 @@ interface PresignedPlayback {
   url: string;
 }
 
+export interface MultipartPart {
+  etag: string;
+  partNumber: number;
+  sizeBytes: number;
+}
+
+export interface PresignedMultipartPart {
+  expiresAt: Date;
+  method: 'PUT';
+  partNumber: number;
+  url: string;
+}
+
 @Injectable()
 export class ObjectStorageService {
   private readonly bucket: string;
   private readonly client: S3Client;
+  private readonly signingClient: S3Client;
   private readonly configureBucketCors: boolean;
   private readonly frontendOrigin: string;
   private readonly readUrlTtlSeconds: number;
@@ -53,14 +72,21 @@ export class ObjectStorageService {
     this.uploadUrlTtlSeconds = config.getOrThrow<number>(
       'UPLOAD_URL_TTL_SECONDS',
     );
-    this.client = new S3Client({
-      endpoint: config.getOrThrow<string>('S3_ENDPOINT'),
+    const clientOptions = {
       forcePathStyle: config.getOrThrow<boolean>('S3_FORCE_PATH_STYLE'),
       region: config.getOrThrow<string>('S3_REGION'),
       credentials: {
         accessKeyId: config.getOrThrow<string>('S3_ACCESS_KEY_ID'),
         secretAccessKey: config.getOrThrow<string>('S3_SECRET_ACCESS_KEY'),
       },
+    };
+    this.client = new S3Client({
+      ...clientOptions,
+      endpoint: config.getOrThrow<string>('S3_ENDPOINT'),
+    });
+    this.signingClient = new S3Client({
+      ...clientOptions,
+      endpoint: config.getOrThrow<string>('S3_PUBLIC_ENDPOINT'),
     });
   }
 
@@ -70,7 +96,7 @@ export class ObjectStorageService {
   ): Promise<PresignedUpload> {
     await this.ensureBucket();
     const url = await getSignedUrl(
-      this.client,
+      this.signingClient,
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: objectKey,
@@ -91,12 +117,119 @@ export class ObjectStorageService {
 
   async createReadUrl(objectKey: string): Promise<string> {
     return getSignedUrl(
-      this.client,
+      this.signingClient,
       new GetObjectCommand({
         Bucket: this.bucket,
         Key: objectKey,
       }),
       { expiresIn: this.readUrlTtlSeconds },
+    );
+  }
+
+  async createMultipartUpload(
+    objectKey: string,
+    contentType: string,
+  ): Promise<string> {
+    await this.ensureBucket();
+    const response = await this.client.send(
+      new CreateMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: objectKey,
+        ContentType: contentType,
+      }),
+    );
+    if (!response.UploadId) {
+      throw new BadGatewayException('Object storage did not create an upload');
+    }
+    return response.UploadId;
+  }
+
+  async createMultipartPartUrl(
+    objectKey: string,
+    uploadId: string,
+    partNumber: number,
+  ): Promise<PresignedMultipartPart> {
+    const url = await getSignedUrl(
+      this.signingClient,
+      new UploadPartCommand({
+        Bucket: this.bucket,
+        Key: objectKey,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+      }),
+      { expiresIn: this.uploadUrlTtlSeconds },
+    );
+    return {
+      method: 'PUT',
+      partNumber,
+      url,
+      expiresAt: new Date(Date.now() + this.uploadUrlTtlSeconds * 1000),
+    };
+  }
+
+  async listMultipartParts(
+    objectKey: string,
+    uploadId: string,
+  ): Promise<MultipartPart[]> {
+    const parts: MultipartPart[] = [];
+    let partNumberMarker: string | undefined;
+    do {
+      const response = await this.client.send(
+        new ListPartsCommand({
+          Bucket: this.bucket,
+          Key: objectKey,
+          UploadId: uploadId,
+          PartNumberMarker: partNumberMarker,
+        }),
+      );
+      for (const part of response.Parts ?? []) {
+        if (part.PartNumber && part.ETag) {
+          parts.push({
+            partNumber: part.PartNumber,
+            etag: part.ETag,
+            sizeBytes: part.Size ?? 0,
+          });
+        }
+      }
+      partNumberMarker = response.IsTruncated
+        ? response.NextPartNumberMarker
+        : undefined;
+    } while (partNumberMarker);
+    return parts;
+  }
+
+  async completeMultipartUpload(
+    objectKey: string,
+    uploadId: string,
+    parts: Array<{ etag: string; partNumber: number }>,
+  ): Promise<void> {
+    await this.client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: objectKey,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: [...parts]
+            .sort((left, right) => left.partNumber - right.partNumber)
+            .map((part) => ({
+              ETag: part.etag,
+              PartNumber: part.partNumber,
+            })),
+        },
+      }),
+    );
+  }
+
+  async abortMultipartUpload(
+    objectKey: string,
+    uploadId: string,
+  ): Promise<void> {
+    await this.client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: objectKey,
+        UploadId: uploadId,
+      }),
     );
   }
 

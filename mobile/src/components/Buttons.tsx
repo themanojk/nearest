@@ -59,7 +59,7 @@ export function PrimaryButton({
     <Pressable
       onPress={onPress}
       disabled={loading}
-      style={({ pressed }) => [
+      style={() => [
         withShadow && shadows.button,
         style,
         { borderRadius: radius, overflow: 'hidden' },

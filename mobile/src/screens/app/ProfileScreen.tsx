@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, ScrollView, Pressable } from 'react-native';
+import { ScrollView, Pressable } from 'react-native';
 import { colors, radii, spacing } from '../../theme/theme';
 import { useAllowance, useStore } from '../../state/store';
 import { PLAN } from '../../state/seed';
@@ -93,14 +93,6 @@ export default function ProfileScreen() {
             Deleted automatically 7 days after report completion.
           </Txt>
         </Glass>
-        <Glass variant="soft" radius={radii.cardSm} style={{ padding: 16, gap: 6 }}>
-          <Txt weight="semibold" size={14} color={colors.ink}>
-            Guardian sharing
-          </Txt>
-          <Txt size={13} color={colors.body} lh={19}>
-            No guardians added. Sharing requires their own confirmed account.
-          </Txt>
-        </Glass>
         <OutlineButton
           label="Delete all recordings"
           color={colors.destructive}
@@ -148,7 +140,7 @@ export default function ProfileScreen() {
       </Pressable>
 
       <Txt size={11} color={colors.muted} center style={{ marginTop: 8 }}>
-        NearNest 1.0.4 · signed in as parent@nearnest.app
+        NearNest 1.0.4 · signed in as {state.authedPhone ?? '+91 90000 00000'}
       </Txt>
     </ScrollView>
   );

@@ -86,14 +86,21 @@ export const gradients: {
   },
 };
 
-/** Font families. Google's static Work Sans registers 500/600 under their own
- * family names, so reference those directly rather than relying on fontWeight. */
+/**
+ * Font families are referenced by their file basename (which equals each file's
+ * PostScript name). This is the one form that resolves on BOTH platforms:
+ *   - Android resolves fontFamily by the asset file name in assets/fonts.
+ *   - iOS resolves it as a font (PostScript) name when it isn't a family name.
+ * Using the human family name ("Work Sans") works on iOS but NOT Android, where
+ * there is no "Work Sans.ttf" asset — so the text silently falls back to the
+ * system font. Each weight is its own file, so do not also set fontWeight.
+ */
 export const fonts = {
-  serif: 'Instrument Serif',
-  regular: 'Work Sans',
-  medium: 'Work Sans Medium',
-  semibold: 'Work Sans SemiBold',
-  bold: 'Work Sans',
+  serif: 'InstrumentSerif-Regular',
+  regular: 'WorkSans-Regular',
+  medium: 'WorkSans-Medium',
+  semibold: 'WorkSans-SemiBold',
+  bold: 'WorkSans-Bold',
 } as const;
 
 export const spacing = {
@@ -129,19 +136,21 @@ export const shadows = {
     shadowOffset: { width: 0, height: 30 },
     elevation: 24,
   },
+  // No `elevation` on the translucent glass surfaces: Android renders an
+  // elevation shadow on a semi-transparent rounded view as a doubled/white
+  // inner box. iOS still gets its soft shadow via the shadow* props below;
+  // on Android the border carries the edge definition (per the handoff).
   card: {
     shadowColor: 'rgba(60,100,70,1)',
     shadowOpacity: 0.14,
     shadowRadius: 16,
     shadowOffset: { width: 0, height: 12 },
-    elevation: 6,
   },
   bar: {
     shadowColor: 'rgba(60,100,70,1)',
     shadowOpacity: 0.1,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: -2 },
-    elevation: 12,
   },
   button: {
     shadowColor: 'rgba(47,110,72,1)',
@@ -162,7 +171,6 @@ export const shadows = {
     shadowOpacity: 0.1,
     shadowRadius: 7,
     shadowOffset: { width: 0, height: 4 },
-    elevation: 3,
   },
 } as const;
 

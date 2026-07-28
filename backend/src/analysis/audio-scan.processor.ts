@@ -87,6 +87,7 @@ export class AudioScanProcessor extends WorkerHost {
           tenantId: job.data.tenantId,
           'scanStage.status': {
             $in: [
+              PipelineStageStatus.Pending,
               PipelineStageStatus.Queueing,
               PipelineStageStatus.Queued,
             ],

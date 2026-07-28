@@ -8,6 +8,25 @@ native modules Expo Go can't host.
 This package is intentionally **outside** the monorepo's npm workspaces to avoid
 Metro/workspace hoisting problems.
 
+Secure hardware pairing separates BLE discovery from backend authorization.
+`BleWifiTransport` must return the manufacturer-provisioned serial and
+implement `signPairingChallenge`; the wearable signs the exact UTF-8 payload
+returned by the backend without exposing its private key. The default
+`SimulatedTransport` is UI-only and deliberately cannot produce a trusted
+signature.
+
+Bulk recordings never travel over BLE. The app creates a resumable multipart
+analysis upload for every finalized WAV on the SD card. The ESP creates a
+temporary one-client WPA2 hotspot with no internet route; its random password
+and request token are delivered over encrypted BLE. Android caches resumable
+10 MiB ranges, disconnects from that hotspot, and then uploads the cached parts
+through the phone's normal internet connection. Multiple recordings from the
+same day are queued separately. Persisted part status is stored server-side per
+recording, so retrying continues from missing parts instead of restarting a
+large recording. Once every queued WAV has reached durable object storage, the
+app releases it from SD. The ESP remains idle after boot and after sync until
+the parent explicitly selects **Start recording** on the Device screen.
+
 ## Requirements
 
 - **Node 22.19.0** (see repo `.nvmrc`; RN 0.86 needs ≥ 20.19). Use `nvm use`.
@@ -53,19 +72,48 @@ npm run android
   (the separate `Work Sans Medium`/`SemiBold` family names don't resolve
   reliably under the new architecture).
 
+## Authentication
+
+The mobile app signs in with the backend phone OTP flow. Lower environments use
+the fixed OTP `1234`. Access and rotating refresh tokens are stored through
+`react-native-keychain`, backed by iOS Keychain and Android Keystore. Sessions
+are restored on launch, refreshed once after an unauthorized API response, and
+revoked during logout.
+
+The current Android development API URL is `http://127.0.0.1:9000/v1`, matching
+the repository's local `BACKEND_PORT`. A USB-connected device needs ADB port
+forwarding for both the API and Metro:
+
+```bash
+adb reverse tcp:9000 tcp:9000
+adb reverse tcp:8081 tcp:8081
+```
+
+A production build must supply a reachable HTTPS API endpoint before release.
+
 ## ESP device integration
 
 `src/services/transport.ts` defines a single `DeviceTransport` interface with:
 
-- `SimulatedTransport` (**default**) — prototype timings, so the whole app is
-  clickable with no hardware.
-- `BleWifiTransport` — real integration points (marked `TODO(device)`) for BLE
-  pairing/firmware over `react-native-ble-plx` and the transfer→upload pipeline
-  (BLE for control, Wi-Fi/HTTP for bulk transfer to the backend presigned URL).
+- `BleWifiTransport` (**default**) — BLE discovery, authenticated bonding,
+  challenge signing, recording control, and temporary-hotspot credentials over
+  `react-native-ble-plx`.
+- `SimulatedTransport` — retained only for explicit UI previews and tests.
 
-To go live, flip the exported `transport` to `new BleWifiTransport()` and
-implement the TODOs. iOS usage strings (`NSBluetoothAlwaysUsageDescription`,
-`NSLocalNetworkUsageDescription`) are already in `ios/.../Info.plist`.
+Android uses a native Kotlin bridge with `WifiNetworkSpecifier`; iOS uses a
+native Swift bridge with `NEHotspotConfigurationManager`. Both platforms stream
+file I/O natively, so progress reflects actual bytes. BLE carries control JSON
+only.
+
+iOS hotspot joining must be tested on a physical iPhone; the simulator cannot
+join Wi-Fi networks. The app target includes the Hotspot Configuration
+entitlement, so the Apple App ID and development/distribution provisioning
+profiles must also have the **Hotspot Configuration** capability enabled.
+
+The ESP always serves at `http://192.168.4.1` inside its isolated WPA2 network.
+The HTTP request is additionally protected by the one-time BLE-delivered token.
+Object-storage URLs only need to be reachable by the phone after it returns to
+mobile data or its normal Wi-Fi; they are never shared with the ESP.
 
 Nothing above this layer (sync flow, pairing UI) knows which transport is used.
 

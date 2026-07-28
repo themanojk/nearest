@@ -62,7 +62,7 @@ Create an analysis and request an upload URL:
 ```bash
 curl -X POST http://localhost:3000/v1/audio-analysis \
   -H 'content-type: application/json' \
-  -H 'x-tenant-id: local-dev' \
+  -H 'Authorization: Bearer <access-token>' \
   -d '{
     "childId": "child-001",
     "fileName": "recording.m4a",
@@ -76,9 +76,18 @@ presigned URL. Then call:
 
 ```bash
 curl -X POST \
-  -H 'x-tenant-id: local-dev' \
+  -H 'Authorization: Bearer <access-token>' \
   http://localhost:3000/v1/audio-analysis/{analysisId}/complete-upload
 ```
+
+Obtain the access token through `POST /v1/auth/otp/send` followed by
+`POST /v1/auth/otp/verify`. Lower environments use the fixed OTP `1234`.
+
+Wearable recordings use BLE only for control messages. For bulk data, the ESP
+creates an isolated one-client WPA2 hotspot with no internet route. The phone
+caches resumable 10 MiB ranges, leaves the hotspot, and uploads them through
+its normal internet connection, so an interrupted 500 MB sync continues from
+missing chunks instead of restarting the complete file.
 
 The completion endpoint verifies the object before submitting a deterministic
 BullMQ ingestion job. Repeating the request does not create a second job. The

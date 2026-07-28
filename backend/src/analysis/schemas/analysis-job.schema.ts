@@ -25,6 +25,11 @@ export enum TranscriptionLanguageMode {
   HindiHinglish = 'HINDI_HINGLISH',
 }
 
+export enum AudioUploadMode {
+  Multipart = 'MULTIPART',
+  Single = 'SINGLE',
+}
+
 export interface AudioStreamMetadata {
   channelLayout?: string;
   channels?: number;
@@ -72,6 +77,22 @@ export class AnalysisJob {
 
   @Prop({ required: true, min: 1 })
   sizeBytes!: number;
+
+  @Prop({
+    default: AudioUploadMode.Single,
+    enum: AudioUploadMode,
+    required: true,
+  })
+  uploadMode!: AudioUploadMode;
+
+  @Prop()
+  multipartUploadId?: string;
+
+  @Prop({ min: 5 * 1024 * 1024 })
+  multipartPartSizeBytes?: number;
+
+  @Prop({ min: 1, max: 10_000 })
+  multipartPartCount?: number;
 
   @Prop({
     required: true,

@@ -3,11 +3,13 @@ import { Queue } from 'bullmq';
 const apiBaseUrl =
   process.env.BACKEND_BASE_URL ??
   'http://127.0.0.1:3000/v1/audio-analysis';
+const apiRoot = apiBaseUrl.replace(/\/audio-analysis\/?$/, '');
 const redisHost = process.env.REDIS_HOST ?? '127.0.0.1';
 const redisPort = Number(process.env.REDIS_PORT ?? 56379);
 const frontendOrigin =
   process.env.FRONTEND_ORIGIN ?? 'http://localhost:5173';
 const tenantId = `smoke-${Date.now()}`;
+const phoneNumber = `9${String(Date.now()).slice(-9)}`;
 
 function createToneWav(durationMs = 1_000, sampleRate = 16_000) {
   const sampleCount = Math.round((durationMs / 1000) * sampleRate);
@@ -45,11 +47,37 @@ async function responseJson(response, operation) {
   return response.json();
 }
 
+const otpResponse = await fetch(`${apiRoot}/auth/otp/send`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    channel: 'phone',
+    phone: {
+      countryCode: '+91',
+      number: phoneNumber,
+    },
+  }),
+});
+const otp = await responseJson(otpResponse, 'Send development OTP');
+const verifyResponse = await fetch(`${apiRoot}/auth/otp/verify`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    verificationId: otp.data.verificationId,
+    code: otp.data.developmentCode ?? '1234',
+  }),
+});
+const authenticated = await responseJson(
+  verifyResponse,
+  'Verify development OTP',
+);
+const authorization = `Bearer ${authenticated.data.tokens.accessToken}`;
+
 const createResponse = await fetch(apiBaseUrl, {
   method: 'POST',
   headers: {
+    authorization,
     'content-type': 'application/json',
-    'x-tenant-id': tenantId,
   },
   body: JSON.stringify({
     childId: 'smoke-child',
@@ -89,13 +117,13 @@ if (!uploadResponse.ok) {
 const completionUrl = `${apiBaseUrl}/${created.analysisId}/complete-upload`;
 const completionResponse = await fetch(completionUrl, {
   method: 'POST',
-  headers: { 'x-tenant-id': tenantId },
+  headers: { authorization },
 });
 const completed = await responseJson(completionResponse, 'Complete upload');
 
 const repeatedResponse = await fetch(completionUrl, {
   method: 'POST',
-  headers: { 'x-tenant-id': tenantId },
+  headers: { authorization },
 });
 const repeated = await responseJson(repeatedResponse, 'Repeat completion');
 
@@ -109,7 +137,7 @@ while (
   await new Promise((resolve) => setTimeout(resolve, 200));
   const statusResponse = await fetch(
     `${apiBaseUrl}/${created.analysisId}`,
-    { headers: { 'x-tenant-id': tenantId } },
+    { headers: { authorization } },
   );
   current = await responseJson(statusResponse, 'Get analysis');
 }

@@ -57,19 +57,20 @@ describe('AudioScanProcessor', () => {
     const updateOne = jest.fn().mockReturnValue({
       exec: jest.fn().mockResolvedValue(undefined),
     });
-    const analysisModel = {
-      findOneAndUpdate: jest.fn().mockReturnValue({
-        exec: jest.fn().mockResolvedValue({
-          _id: new Types.ObjectId(analysisId),
-          tenantId: 'tenant-a',
-          status: AnalysisStatus.Processing,
-          scanStage: {
-            status: PipelineStageStatus.Running,
-            progress: 10,
-            attempts: 1,
-          },
-        }),
+    const findOneAndUpdate = jest.fn().mockReturnValue({
+      exec: jest.fn().mockResolvedValue({
+        _id: new Types.ObjectId(analysisId),
+        tenantId: 'tenant-a',
+        status: AnalysisStatus.Processing,
+        scanStage: {
+          status: PipelineStageStatus.Running,
+          progress: 10,
+          attempts: 1,
+        },
       }),
+    });
+    const analysisModel = {
+      findOneAndUpdate,
       findOne: jest.fn().mockReturnValue({
         exec: jest.fn().mockResolvedValue(null),
       }),
@@ -128,6 +129,7 @@ describe('AudioScanProcessor', () => {
 
     return {
       deleteMany,
+      findOneAndUpdate,
       insertMany,
       processor,
       storage,
@@ -152,6 +154,7 @@ describe('AudioScanProcessor', () => {
   it('persists scan windows, speech intervals, and summary', async () => {
     const {
       deleteMany,
+      findOneAndUpdate,
       insertMany,
       processor,
       storage,
@@ -171,6 +174,15 @@ describe('AudioScanProcessor', () => {
     );
 
     expect(storage.createReadUrl).toHaveBeenCalled();
+    expect(findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'scanStage.status': {
+          $in: expect.arrayContaining([PipelineStageStatus.Pending]),
+        },
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
     expect(workerClient.scanAudio).toHaveBeenCalledWith(
       analysisId,
       'http://object-store/signed-audio',

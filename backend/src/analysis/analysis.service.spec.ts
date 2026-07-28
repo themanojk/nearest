@@ -12,6 +12,7 @@ import {
   AnalysisJob,
   AnalysisJobDocument,
   AnalysisStatus,
+  AudioUploadMode,
   PipelineStageStatus,
 } from './schemas/analysis-job.schema';
 import { ScanSegment } from './schemas/scan-segment.schema';
@@ -38,6 +39,7 @@ function analysisDocument(
     originalFileName: 'day.m4a',
     contentType: 'audio/mp4',
     sizeBytes: 128,
+    uploadMode: AudioUploadMode.Single,
     status,
     progress: 0,
     ingestStage: {
@@ -103,6 +105,19 @@ describe('AnalysisService', () => {
     } as unknown as Queue<AggregateRiskJob>;
     const storage = {
       createUploadUrl: jest.fn().mockResolvedValue(upload),
+      createMultipartUpload: jest.fn().mockResolvedValue('multipart-upload-a'),
+      createMultipartPartUrl: jest.fn().mockImplementation(
+        (_key: string, _uploadId: string, partNumber: number) =>
+          Promise.resolve({
+            method: 'PUT',
+            partNumber,
+            url: `http://object-store/part/${partNumber}`,
+            expiresAt: new Date(),
+          }),
+      ),
+      listMultipartParts: jest.fn().mockResolvedValue([]),
+      completeMultipartUpload: jest.fn().mockResolvedValue(undefined),
+      abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
       createPlaybackUrl: jest.fn().mockResolvedValue({
         url: 'http://object-store/playback',
         expiresAt: new Date('2026-07-24T13:00:00.000Z'),
@@ -113,7 +128,7 @@ describe('AnalysisService', () => {
       }),
     } as unknown as ObjectStorageService;
     const config = {
-      getOrThrow: jest.fn().mockReturnValue(1024),
+      getOrThrow: jest.fn().mockReturnValue(10 * 1024 * 1024 * 1024),
     } as unknown as ConfigService;
 
     return {
@@ -188,6 +203,83 @@ describe('AnalysisService', () => {
     );
     expect(result.status).toBe(AnalysisStatus.Queued);
     expect(document.save).toHaveBeenCalled();
+  });
+
+  it('creates a resumable multipart upload for wearable audio', async () => {
+    const { model, service, storage } = setup();
+
+    const result = await service.create('tenant-a', {
+      childId: 'child-a',
+      fileName: 'full-day.wav',
+      contentType: 'audio/wav',
+      sizeBytes: 25 * 1024 * 1024,
+      uploadMode: AudioUploadMode.Multipart,
+    });
+
+    expect(model.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        uploadMode: AudioUploadMode.Multipart,
+        multipartPartCount: 3,
+        multipartPartSizeBytes: 10 * 1024 * 1024,
+      }),
+    );
+    expect(storage.createMultipartUpload).toHaveBeenCalled();
+    expect(result.multipart).toEqual({
+      partCount: 3,
+      partSizeBytes: 10 * 1024 * 1024,
+    });
+    expect(result.upload).toBeUndefined();
+  });
+
+  it('issues multipart URLs only for requested in-range chunks', async () => {
+    const document = analysisDocument();
+    document.uploadMode = AudioUploadMode.Multipart;
+    document.multipartUploadId = 'multipart-upload-a';
+    document.multipartPartCount = 3;
+    document.multipartPartSizeBytes = 10 * 1024 * 1024;
+    const { service, storage } = setup(document);
+
+    const result = await service.createMultipartPartUrls(
+      'tenant-a',
+      document._id.toString(),
+      { partNumbers: [3, 1, 1] },
+    );
+
+    expect(result.parts.map((part) => part.partNumber)).toEqual([1, 3]);
+    expect(storage.createMultipartPartUrl).toHaveBeenCalledTimes(2);
+    await expect(
+      service.createMultipartPartUrls(
+        'tenant-a',
+        document._id.toString(),
+        { partNumbers: [4] },
+      ),
+    ).rejects.toThrow('out of range');
+  });
+
+  it('completes only when every multipart byte is present', async () => {
+    const document = analysisDocument();
+    document.uploadMode = AudioUploadMode.Multipart;
+    document.multipartUploadId = 'multipart-upload-a';
+    document.multipartPartCount = 1;
+    document.multipartPartSizeBytes = 10 * 1024 * 1024;
+    const { queue, service, storage } = setup(document);
+    (storage.listMultipartParts as jest.Mock).mockResolvedValue([
+      { partNumber: 1, etag: '"etag-a"', sizeBytes: 128 },
+    ]);
+
+    const result = await service.completeMultipartUpload(
+      'tenant-a',
+      document._id.toString(),
+    );
+
+    expect(storage.completeMultipartUpload).toHaveBeenCalledWith(
+      document.sourceObjectKey,
+      'multipart-upload-a',
+      [{ partNumber: 1, etag: '"etag-a"', sizeBytes: 128 }],
+    );
+    expect(storage.assertObject).toHaveBeenCalled();
+    expect(queue.add).toHaveBeenCalled();
+    expect(result.status).toBe(AnalysisStatus.Queued);
   });
 
   it('does not enqueue an analysis that is already queued', async () => {

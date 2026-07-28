@@ -1,6 +1,7 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { AuthModule } from '../auth/auth.module';
 import { StorageModule } from '../storage/storage.module';
 import {
   AUDIO_INGEST_QUEUE,
@@ -57,6 +58,7 @@ import { RiskAggregationProcessor } from './risk-aggregation.processor';
 
 @Module({
   imports: [
+    AuthModule,
     MongooseModule.forFeature([
       {
         name: AnalysisJob.name,

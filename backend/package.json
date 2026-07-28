@@ -8,7 +8,9 @@
     "start:dev": "nest start --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"{src,test}/**/*.ts\"",
-    "test": "jest"
+    "test": "jest",
+    "device:provision": "node scripts/provision-device.mjs",
+    "device:identity": "node scripts/generate-device-identity.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1094.0",
@@ -17,11 +19,13 @@
     "@nestjs/common": "^11.0.0",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.0",
+    "@nestjs/jwt": "^11.0.2",
     "@nestjs/mongoose": "^11.0.4",
     "@nestjs/platform-express": "^11.0.0",
     "bullmq": "^5.81.1",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "dotenv": "^17.4.2",
     "mongoose": "^9.8.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.0"

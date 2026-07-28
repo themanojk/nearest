@@ -8,7 +8,10 @@ import {
   Max,
   Min,
 } from 'class-validator';
-import { TranscriptionLanguageMode } from '../schemas/analysis-job.schema';
+import {
+  AudioUploadMode,
+  TranscriptionLanguageMode,
+} from '../schemas/analysis-job.schema';
 
 export class CreateAnalysisDto {
   @IsString()
@@ -29,6 +32,10 @@ export class CreateAnalysisDto {
   @Min(1)
   @Max(Number.MAX_SAFE_INTEGER)
   sizeBytes!: number;
+
+  @IsOptional()
+  @IsEnum(AudioUploadMode)
+  uploadMode?: AudioUploadMode = AudioUploadMode.Single;
 
   @IsOptional()
   @IsEnum(TranscriptionLanguageMode)

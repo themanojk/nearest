@@ -109,7 +109,7 @@ export const PLAN = {
   cadence: ' / month',
   trial: '7-DAY TRIAL',
   features:
-    '40 syncs per month · unlimited report history · guardian sharing · priority processing',
+    '40 syncs per month · unlimited report history · priority processing',
   trialFootnote:
     "You won't be charged until your trial ends. Cancel anytime from Settings.",
 };
