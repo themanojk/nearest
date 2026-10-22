@@ -1,12 +1,12 @@
-import React, { useCallback, useEffect } from 'react';
-import { View, ScrollView, Pressable } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { AppState, View, ScrollView } from 'react-native';
 import { colors, radii, spacing } from '../../theme/theme';
 import { useAllowance, useStore } from '../../state/store';
 import Glass from '../../components/Glass';
 import Txt from '../../components/Txt';
 import Chip from '../../components/Chip';
 import ProgressBar from '../../components/ProgressBar';
-import EventRow from '../../components/EventRow';
+import HomeInsights from '../../components/HomeInsights';
 import { transport } from '../../services/transport';
 
 function Stat({ label, value }: { label: string; value: string }) {
@@ -23,28 +23,47 @@ function Stat({ label, value }: { label: string; value: string }) {
 }
 
 export default function TodayScreen() {
-  const { state, patch, reports, restoreSample } = useStore();
+  const { state, patch } = useStore();
   const { used, total, remaining, resets } = useAllowance();
-  const refreshTelemetry = useCallback(async () => {
-    try {
-      const telemetry = await transport.getDeviceTelemetry();
-      patch({
-        deviceBattery: telemetry.batteryPercent,
-        deviceStorage: Math.round(
-          (telemetry.storageUsedBytes / telemetry.storageTotalBytes) * 100,
-        ),
-      });
-    } catch {
-      // Preserve the last successful reading while the wearable is out of
-      // range. The next screen visit retries the BLE telemetry request.
-    }
-  }, [patch]);
+  const [uploadedCount, setUploadedCount] = useState<number | null>(null);
+  const telemetryInFlight = useRef(false);
 
   useEffect(() => {
+    if (state.syncStage !== null) return;
+    let disposed = false;
+    let appState = AppState.currentState;
+    const refreshTelemetry = async () => {
+      if (disposed || appState !== 'active' || telemetryInFlight.current) return;
+      telemetryInFlight.current = true;
+      try {
+        const telemetry = await transport.getDeviceTelemetry();
+        if (disposed || appState !== 'active') return;
+        patch({
+          deviceBattery: telemetry.batteryPercent,
+          deviceStorage: Math.round(
+            (telemetry.storageUsedBytes / telemetry.storageTotalBytes) * 100,
+          ),
+        });
+      } catch {
+        // Keep the last reading when disconnected; retry on the next tick.
+      } finally {
+        telemetryInFlight.current = false;
+      }
+    };
     void refreshTelemetry();
-  }, [refreshTelemetry]);
+    const timer = setInterval(() => void refreshTelemetry(), 10_000);
+    const subscription = AppState.addEventListener('change', nextState => {
+      const wasActive = appState === 'active';
+      appState = nextState;
+      if (!wasActive && nextState === 'active') void refreshTelemetry();
+    });
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      subscription.remove();
+    };
+  }, [patch, state.syncStage]);
 
-  const todayReport = reports.find((r) => r.isToday);
 
   return (
     <ScrollView
@@ -61,6 +80,7 @@ export default function TodayScreen() {
           }}
         />
       )}
+
 
       {/* Device card */}
       <Glass variant="strong" radius={radii.card} shadow="card" style={{ padding: 20, gap: 12 }}>
@@ -87,6 +107,7 @@ export default function TodayScreen() {
                 : `${state.deviceStorage}%`
             }
           />
+          <Stat label="Uploaded recordings" value={uploadedCount === null ? '—' : String(uploadedCount)} />
           <Stat label="" value={`${remaining}/${total} syncs`} />
         </View>
         <Txt size={11} color={colors.muted}>
@@ -102,36 +123,7 @@ export default function TodayScreen() {
         </Txt>
       </View>
 
-      {/* Today's moments */}
-      <View style={{ gap: 10 }}>
-        <Txt weight="serif" size={17} color={colors.ink}>
-          Today's moments
-        </Txt>
-        {todayReport ? (
-          todayReport.events.map((e) => (
-            <EventRow
-              key={e.id}
-              event={e}
-              onPress={() =>
-                patch({ selectedReportId: todayReport.id, selectedEventId: e.id })
-              }
-            />
-          ))
-        ) : (
-          <Glass variant="soft" radius={radii.cardSm} style={{ padding: 14, gap: 8 }}>
-            <Txt size={12.5} color={colors.body} lh={19}>
-              No sync yet today. Tap the sync button to capture today's moments.
-            </Txt>
-            {state.historyCleared && (
-              <Pressable onPress={restoreSample}>
-                <Txt weight="semibold" size={12.5} color={colors.statusGreen}>
-                  Restore sample data
-                </Txt>
-              </Pressable>
-            )}
-          </Glass>
-        )}
-      </View>
+      <HomeInsights onCount={setUploadedCount} refreshKey={state.syncsUsed} paused={state.syncStage !== null && !['complete', 'failed', 'preflight'].includes(state.syncStage)} />
 
       {/* Standing disclaimer */}
       <Glass variant="soft" radius={radii.cardSm} style={{ padding: 14 }}>

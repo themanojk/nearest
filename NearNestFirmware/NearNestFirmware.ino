@@ -1,3 +1,11 @@
+#include "lossless_flac.h"
+#include "NearNestBuildConfig.h"
+#include "audio_gain.h"
+static_assert(NEARNEST_AUDIO_GAIN_PERCENT >= 100 && NEARNEST_AUDIO_GAIN_PERCENT <= 800,
+              "Audio gain must be between 100 and 800 percent");
+#if NEARNEST_RECORD_MP3
+#include "mp3_encoder.h"
+#endif
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <Preferences.h>
@@ -11,6 +19,12 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <esp_system.h>
+#include <atomic>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include "recorder_control.h"
+#include "recorder_status.h"
+#include <Adafruit_NeoPixel.h>
 
 #if !defined(ARDUINO_ARCH_ESP32)
 #error "This sketch requires an ESP32 board package and an ESP32-family board selection in Arduino IDE."
@@ -27,17 +41,15 @@ namespace {
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint8_t kBitsPerSample = 16;
 constexpr size_t kSamplesPerChunk = 512;
-constexpr uint32_t kRecordingHeartbeatMs = 0;
 constexpr uint32_t kRecordingProgressLogIntervalMs = 10000;
-constexpr uint32_t kHeaderSyncIntervalMs = 5000;
+// Rewriting the WAV header requires closing and reopening the file. Doing that
+// every few seconds makes marginal SPI SD cards stall during live recording.
+constexpr uint32_t kHeaderSyncIntervalMs = 30000;
 constexpr uint32_t kMaxRecordingSeconds = 0;  // 0 = record until reset/power off
-constexpr uint32_t kProblemIndicatorIntervalMs = 5000;
 constexpr uint32_t kSdWriteLockTimeoutMs = 3000;
-constexpr uint8_t kSdWriteRetryCount = 8;
-constexpr uint32_t kSdWriteRetryDelayMs = 30;
-constexpr bool kBuzzerEnabled = true;
-constexpr bool kBuzzerActiveHigh = true;
-constexpr bool kBuzzerReleasePinWhenIdle = false;
+constexpr uint8_t kSdWriteRetryCount = 20;
+constexpr uint32_t kSdWriteRetryDelayMs = 60;
+constexpr uint8_t kSdWriteRemountEveryRetries = 5;
 constexpr bool kAudioCleanupEnabled = true;
 constexpr float kAudioHighPassAlpha = 0.992f;
 constexpr float kAudioLowPassAlpha = 0.22f;
@@ -63,7 +75,9 @@ constexpr uint32_t kSdTransferSpiFrequencies[] = {
 };
 constexpr size_t kSdTransferProbeBytes = 64 * 1024;
 
-constexpr int kBuzzerPin = 22;
+constexpr int kButtonPin = 27;
+constexpr int kRgbLedPin = 21;  // Single-wire RGB/WS2812 data input.
+constexpr uint8_t kRgbLedCount = 1;
 constexpr int kGpsRxPin = 16;
 constexpr int kGpsTxPin = 17;
 constexpr uint32_t kGpsBaudRates[] = {9600, 38400, 115200, 57600};
@@ -75,9 +89,6 @@ constexpr uint32_t kGpsBaudScanIntervalMs = 2000;
 // GPS collection and SD persistence remain enabled. Set this to true only when
 // diagnosing the GPS module from the Arduino Serial Monitor.
 constexpr bool kGpsSerialLogsEnabled = false;
-constexpr uint8_t kGpsFixBeepCount = 5;
-constexpr uint16_t kGpsFixBeepOnMs = 70;
-constexpr uint16_t kGpsFixBeepOffMs = 90;
 
 constexpr char kRecordingDir[] = "/";
 constexpr char kIndexFile[] = "/index.csv";
@@ -107,7 +118,7 @@ struct WavHeader {
   uint32_t subchunk2Size;
 };
 
-RecorderState gState = RecorderState::Stopped;
+std::atomic<RecorderState> gState = RecorderState::Stopped;
 NearNestConnectivity gConnectivity;
 SPIClass gSdSpi(VSPI);
 HardwareSerial gGpsSerial(1);
@@ -127,9 +138,15 @@ String gRecordingPath;
 TaskHandle_t gRecordingTaskHandle = nullptr;
 SemaphoreHandle_t gSdMutex = nullptr;
 uint32_t gRecordingDataBytes = 0;
+uint64_t gRecordingSamples = 0;
+uint64_t gRecordingEncodeUs = 0;
+constexpr size_t kRecordingHeaderBytes = NEARNEST_RECORD_MP3 ? 0 : NEARNEST_RECORD_FLAC ? nest_flac::headerBytes : sizeof(WavHeader);
+constexpr const char *kRecordingExtension = NEARNEST_RECORD_MP3 ? "mp3" : NEARNEST_RECORD_FLAC ? "flac" : "wav";
+#if NEARNEST_RECORD_MP3
+nest_mp3::Encoder gMp3Encoder;
+#endif
 uint32_t gRecordingStartMs = 0;
 uint32_t gLastHeaderSyncMs = 0;
-uint32_t gLastHeartbeatMs = 0;
 uint32_t gLastGpsLogMs = 0;
 uint32_t gLastGpsPersistMs = 0;
 uint32_t gLastGpsByteMs = 0;
@@ -142,21 +159,19 @@ uint32_t gSdRecoveredWriteAttempts = 0;
 uint32_t gSdWriteFailureEvents = 0;
 uint32_t gRecordingGpsPointIndex = 0;
 
-bool gBuzzerActive = false;
-uint32_t gBuzzerToggleAtMs = 0;
-uint8_t gBuzzerPhaseRemaining = 0;
-uint16_t gBuzzerOnMs = 0;
-uint16_t gBuzzerOffMs = 0;
-bool gBuzzerPinLevel = false;
-bool gProblemIndicatorEnabled = false;
+std::atomic<bool> gProblemIndicatorEnabled{false};
+Adafruit_NeoPixel gStatusLed(kRgbLedCount, kRgbLedPin, NEO_GRB + NEO_KHZ800);
 bool gMicReady = false;
 bool gSdReady = false;
+bool gSdRecoveryPending = false;  // Protected by RecorderLock.
+uint32_t gLastSdRecoveryMs = 0;
+std::atomic<bool> gTransferStorageActive{false};
 uint32_t gSdCurrentSpiFrequency = kSdSpiFrequency;
 bool gGpsReady = false;
 bool gGpsHasLocation = false;
 bool gGpsHasUtc = false;
 bool gGpsLockAnnounced = false;
-bool gGpsFixBeepPlayed = false;
+bool gGpsFixNotified = false;
 bool gRecordingStartUtcResolved = false;
 bool gFirstFixMetadataWritten = false;
 bool gRecordingPublishedForTransfer = false;
@@ -176,7 +191,6 @@ uint8_t gGpsSatellitesInView = 0;
 char gGpsRmcStatus = '?';
 size_t gGpsBaudIndex = 0;
 uint32_t gGpsLastFixMs = 0;
-uint32_t gLastProblemIndicatorMs = 0;
 int64_t gGpsLastUtcMs = 0;
 int64_t gGpsCurrentUtcMs = 0;
 String gGpsLastUtcIso;
@@ -187,11 +201,145 @@ float gHighPassPrevInput = 0.0f;
 float gHighPassPrevOutput = 0.0f;
 float gLowPassPrevOutput = 0.0f;
 
-void startBuzzerPattern(uint8_t beepCount, uint16_t onMs, uint16_t offMs);
+
 void recordingTaskMain(void *parameter);
+bool startRecording();
+bool recoverRecorderStorage();
+bool stopRecording(const char *reason);
 const char *gpsStateLabel();
 bool enterTransferStorageMode(const String &probePath);
 void leaveTransferStorageMode();
+
+using LedFeedback = recorder_status::Feedback;
+recorder_control::Button gButton;
+RTC_DATA_ATTR bool gSleepWaitingForRelease = false;
+std::atomic<bool> gButtonRtcMode{false};
+std::atomic<bool> gSleepArmed{false};
+std::atomic<bool> gSaving{false};
+std::atomic<uint32_t> gSaveVisibleUntil{0};
+std::atomic<recorder_control::Action> gButtonAction{recorder_control::Action::None};
+std::atomic<bool> gButtonBusy{false};
+std::atomic<uint32_t> gGpsNoticeUntil{0};
+std::atomic<uint32_t> gFeedbackRequest{0};
+std::atomic<uint32_t> gFeedbackShown{0};
+SemaphoreHandle_t gRecorderMutex = nullptr;
+
+struct RecorderLock {
+  RecorderLock() { xSemaphoreTakeRecursive(gRecorderMutex, portMAX_DELAY); }
+  ~RecorderLock() { xSemaphoreGiveRecursive(gRecorderMutex); }
+};
+
+void indicatorTaskMain(void *) {
+  gStatusLed.begin();
+  uint32_t token = 0, started = 0;
+  for (;;) {
+    const uint32_t now = millis();
+    const uint32_t requested = gFeedbackRequest.load();
+    if (requested != token) { token = requested; started = now; }
+    auto feedback = static_cast<LedFeedback>(token & 0xff);
+    if (feedback != LedFeedback::Off && now - started >= recorder_status::feedbackDuration(feedback)) feedback = LedFeedback::None;
+    const auto state = gState.load();
+    const auto ledState = state == RecorderState::Error || gProblemIndicatorEnabled.load()
+        ? recorder_status::State::Error : state == RecorderState::Recording
+        ? recorder_status::State::Recording : recorder_status::State::Stopped;
+    const uint32_t gpsUntil = gGpsNoticeUntil.load();
+    const uint32_t color = recorder_status::indicatorColor(ledState, now, gSaving.load() || (feedback == LedFeedback::None &&
+        static_cast<int32_t>(gSaveVisibleUntil.load() - now) > 0),
+        gpsUntil != 0 && static_cast<int32_t>(gpsUntil - now) > 0,
+        false, feedback, now - started, gSleepArmed.load());
+    gStatusLed.setPixelColor(0, color);
+    gStatusLed.show();
+    gFeedbackShown.store(token);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+bool showLedFeedback(LedFeedback feedback) {
+  const uint32_t token = ((gFeedbackRequest.load() + 0x100u) & 0xffffff00u) |
+      static_cast<uint32_t>(feedback);
+  gFeedbackRequest.store(token);
+  const uint32_t start = millis();
+  while (gFeedbackShown.load() != token) {
+    if (millis() - start >= 1000) return false;
+    delay(5);
+  }
+  delay(recorder_status::feedbackDuration(feedback));
+  return true;
+}
+
+void buttonTaskMain(void *) {
+  gButton.reset(millis(), digitalRead(kButtonPin) == LOW);
+  for (;;) {
+    const uint32_t now = millis();
+    if (gButtonRtcMode.load()) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    const bool pressed = digitalRead(kButtonPin) == LOW;
+    if (gButtonBusy.load() || gButtonAction.load() != recorder_control::Action::None) {
+      gButton.reset(now, pressed);
+      gSleepArmed = false;
+    } else {
+      const auto action = gButton.update(now, pressed);
+      gSleepArmed.store(gButton.sleepArmed());
+      if (action != recorder_control::Action::None) gButtonAction.store(action);
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+bool configureButtonWake(int level) {
+  const auto pin = static_cast<gpio_num_t>(kButtonPin);
+  return rtc_gpio_init(pin) == ESP_OK &&
+      rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY) == ESP_OK &&
+      rtc_gpio_pulldown_dis(pin) == ESP_OK &&
+      rtc_gpio_pullup_en(pin) == ESP_OK &&
+      esp_sleep_enable_ext0_wakeup(pin, level) == ESP_OK;
+}
+
+void enterButtonDeepSleep() {
+  if (!showLedFeedback(LedFeedback::Sleep)) return;
+  gButtonRtcMode = true;
+  delay(10); // Let the sampling task stop touching the digital GPIO.
+  const auto pin = static_cast<gpio_num_t>(kButtonPin);
+  // Sleep immediately while held. Release wakes only a short re-arm path;
+  // the subsequent press wakes the application.
+  gSleepWaitingForRelease = digitalRead(kButtonPin) == LOW;
+  if (!configureButtonWake(gSleepWaitingForRelease ? 1 : 0) ||
+      !showLedFeedback(LedFeedback::Off)) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+    rtc_gpio_deinit(pin);
+    pinMode(kButtonPin, INPUT_PULLUP);
+    gSleepWaitingForRelease = false;
+    gButtonRtcMode = false;
+    gProblemIndicatorEnabled = true;
+    Serial.println("ERROR: sleep setup failed");
+    return;
+  }
+  Serial.println("Deep sleep: LED off; release then press GPIO27 to wake");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+void serviceButton() {
+  if (gButtonAction.load() == recorder_control::Action::None) return;
+  gButtonBusy = true;
+  struct ClearBusy { ~ClearBusy() { gButtonBusy = false; } } clearBusy;
+  const auto action = gButtonAction.exchange(recorder_control::Action::None);
+  RecorderLock recorderLock;
+  const bool hadRecording = gState == RecorderState::Recording;
+  if (hadRecording && !stopRecording("button action")) return;
+  if (hadRecording && !showLedFeedback(LedFeedback::Saved)) return;
+  if (action == recorder_control::Action::NewRecording) {
+    if (!(gState == RecorderState::Error ? recoverRecorderStorage() : startRecording())) { gState = RecorderState::Error; gProblemIndicatorEnabled = true; }
+    else showLedFeedback(LedFeedback::Started);
+  } else if (action == recorder_control::Action::Restart) {
+    if (showLedFeedback(LedFeedback::Restart)) { Serial.flush(); ESP.restart(); }
+  } else if (action == recorder_control::Action::Sleep) {
+    enterButtonDeepSleep();
+  } else {
+    gSdRecoveryPending = false;
+    gConnectivity.enterPairingMode();
+    showLedFeedback(LedFeedback::Pairing);
+  }
+}
 
 const char *resetReasonLabel(esp_reset_reason_t reason) {
   switch (reason) {
@@ -230,17 +378,6 @@ const char *recorderStateLabel() {
       return "ERROR";
   }
   return "UNKNOWN";
-}
-
-void logBuzzerPatternRequest(const char *reason, uint8_t beepCount, uint16_t onMs, uint16_t offMs) {
-  Serial.printf("Buzzer: reason=%s beeps=%u on_ms=%u off_ms=%u state=%s recording_file=%s bytes=%lu\n",
-                reason ? reason : "unspecified",
-                static_cast<unsigned int>(beepCount),
-                static_cast<unsigned int>(onMs),
-                static_cast<unsigned int>(offMs),
-                recorderStateLabel(),
-                gRecordingPath.isEmpty() ? "none" : gRecordingPath.c_str(),
-                static_cast<unsigned long>(gRecordingDataBytes));
 }
 
 bool lockSd(TickType_t timeoutTicks = portMAX_DELAY) {
@@ -944,13 +1081,9 @@ void handleGpsFixUpdate() {
     }
   }
 
-  if (gTinyGps.location.isValid() && gGpsHasUtc && !gGpsFixBeepPlayed) {
-    gGpsFixBeepPlayed = true;
-    logBuzzerPatternRequest("gps_location_fix_acquired",
-                            kGpsFixBeepCount,
-                            kGpsFixBeepOnMs,
-                            kGpsFixBeepOffMs);
-    startBuzzerPattern(kGpsFixBeepCount, kGpsFixBeepOnMs, kGpsFixBeepOffMs);
+  if (gTinyGps.location.isValid() && gGpsHasUtc && !gGpsFixNotified) {
+    gGpsFixNotified = true;
+    gGpsNoticeUntil.store(millis() + 1500);
     if (kGpsSerialLogsEnabled) {
       Serial.printf("GPS location fix acquired: lat=%.6f lon=%.6f utc=%s\n",
                     gGpsLatitude,
@@ -1034,71 +1167,6 @@ void serviceGps() {
   }
 }
 
-void setBuzzerLevel(bool high) {
-  gBuzzerPinLevel = kBuzzerEnabled && high;
-  pinMode(kBuzzerPin, OUTPUT);
-  if (!gBuzzerPinLevel && kBuzzerReleasePinWhenIdle) {
-    pinMode(kBuzzerPin, INPUT_PULLUP);
-    return;
-  }
-
-  const uint8_t outputLevel =
-      gBuzzerPinLevel ? (kBuzzerActiveHigh ? HIGH : LOW) : (kBuzzerActiveHigh ? LOW : HIGH);
-  digitalWrite(kBuzzerPin, outputLevel);
-}
-
-void startBuzzerPattern(uint8_t beepCount, uint16_t onMs, uint16_t offMs) {
-  if (!kBuzzerEnabled) {
-    gBuzzerActive = false;
-    gBuzzerPhaseRemaining = 0;
-    gBuzzerOnMs = 0;
-    gBuzzerOffMs = 0;
-    setBuzzerLevel(false);
-    return;
-  }
-
-  gBuzzerActive = beepCount > 0;
-  gBuzzerPhaseRemaining = beepCount;
-  gBuzzerOnMs = onMs;
-  gBuzzerOffMs = offMs;
-
-  if (!gBuzzerActive) {
-    setBuzzerLevel(false);
-    return;
-  }
-
-  setBuzzerLevel(true);
-  gBuzzerToggleAtMs = millis() + gBuzzerOnMs;
-}
-
-void serviceBuzzer() {
-  if (!gBuzzerActive) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (static_cast<int32_t>(now - gBuzzerToggleAtMs) < 0) {
-    return;
-  }
-
-  if (gBuzzerPinLevel) {
-    setBuzzerLevel(false);
-    if (gBuzzerPhaseRemaining > 0) {
-      gBuzzerPhaseRemaining--;
-    }
-    if (gBuzzerPhaseRemaining == 0) {
-      gBuzzerActive = false;
-      // Serial.println("Buzzer: pattern complete");
-      return;
-    }
-    gBuzzerToggleAtMs = now + gBuzzerOffMs;
-    return;
-  }
-
-  setBuzzerLevel(true);
-  gBuzzerToggleAtMs = now + gBuzzerOnMs;
-}
-
 WavHeader buildWavHeader(uint32_t dataBytes) {
   WavHeader header{};
   memcpy(header.riff, "RIFF", 4);
@@ -1118,13 +1186,24 @@ WavHeader buildWavHeader(uint32_t dataBytes) {
 }
 
 bool writeWavHeader(File &file, uint32_t dataBytes) {
+#if NEARNEST_RECORD_MP3
+  // MP3 frames carry their own headers; never overwrite the first frame.
+  file.flush();
+  return static_cast<bool>(file);
+#else
+#if NEARNEST_RECORD_FLAC
+  uint8_t header[nest_flac::headerBytes];
+  nest_flac::header(header, gRecordingSamples);
+#else
   const WavHeader header = buildWavHeader(dataBytes);
+#endif
   if (!file.seek(0)) {
     return false;
   }
   const size_t written = file.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
   file.flush();
   return written == sizeof(header);
+#endif
 }
 
 bool reopenRecordingFileForWrite(uint32_t dataBytes) {
@@ -1137,7 +1216,7 @@ bool reopenRecordingFileForWrite(uint32_t dataBytes) {
     return false;
   }
 
-  const uint32_t resumeOffset = sizeof(WavHeader) + dataBytes;
+  const uint32_t resumeOffset = kRecordingHeaderBytes + dataBytes;
   if (gRecordingFile.size() < resumeOffset ||
       !gRecordingFile.seek(resumeOffset)) {
     gRecordingFile.close();
@@ -1147,7 +1226,41 @@ bool reopenRecordingFileForWrite(uint32_t dataBytes) {
   return true;
 }
 
+bool recoverRecordingSdForWrite(uint32_t dataBytes) {
+  Serial.println("WARN: recovering SD mount after repeated recording write failures");
+  if (gRecordingFile) {
+    gRecordingFile.close();
+  }
+  SD.end();
+  delay(50);
+  if (!SD.begin(kSdCsPin, gSdSpi, kSdSpiFrequency)) {
+    gSdReady = false;
+    return false;
+  }
+  gSdCurrentSpiFrequency = kSdSpiFrequency;
+  gSdReady = true;
+  return reopenRecordingFileForWrite(dataBytes);
+}
+
+#if NEARNEST_RECORD_MP3
+bool drainMp3Output() {
+  if (!gMp3Encoder.available()) return true;
+  if (!gRecordingFile && !reopenRecordingFileForWrite(gRecordingDataBytes)) return false;
+  while (gMp3Encoder.available()) {
+    const size_t written = gRecordingFile.write(gMp3Encoder.data(), gMp3Encoder.available());
+    if (!written) return false;
+    gRecordingDataBytes += written;
+    gMp3Encoder.consume(written);
+  }
+  return true;
+}
+#endif
+
 bool finalizeRecordingFile() {
+#if NEARNEST_RECORD_MP3
+  // Retain unwritten output across SD failure/recovery and repeated stop calls.
+  if (!drainMp3Output() || !gMp3Encoder.finish() || !drainMp3Output()) return false;
+#endif
   if (gRecordingFile) {
     gRecordingFile.flush();
     gRecordingFile.close();
@@ -1164,6 +1277,10 @@ bool finalizeRecordingFile() {
 }
 
 bool checkpointRecordingFile() {
+  gSaving = true;
+  struct SaveIndicator {
+    ~SaveIndicator() { gSaving = false; gSaveVisibleUntil = millis() + 200; }
+  } saveIndicator;
   if (!gRecordingFile) {
     return false;
   }
@@ -1213,15 +1330,18 @@ String allocateRecordingPath() {
   uint32_t sequence = preferences.getUInt("next", 1);
   if (sequence == 0) sequence = 1;
   for (uint32_t attempts = 0; attempts < 100000; ++attempts, ++sequence) {
-    char path[48];
+    char path[64];
+    const uint32_t uniqueToken = esp_random();
     if (strcmp(kRecordingDir, "/") == 0) {
       snprintf(
-          path, sizeof(path), "/rec_%08lu.wav",
-          static_cast<unsigned long>(sequence));
+          path, sizeof(path), "/rec_%08lu_%08lx.%s",
+          static_cast<unsigned long>(sequence),
+          static_cast<unsigned long>(uniqueToken), kRecordingExtension);
     } else {
       snprintf(
-          path, sizeof(path), "%s/rec_%08lu.wav", kRecordingDir,
-          static_cast<unsigned long>(sequence));
+          path, sizeof(path), "%s/rec_%08lu_%08lx.%s", kRecordingDir,
+          static_cast<unsigned long>(sequence),
+          static_cast<unsigned long>(uniqueToken), kRecordingExtension);
     }
     if (!SD.exists(path)) {
       preferences.putUInt("next", sequence + 1);
@@ -1241,10 +1361,12 @@ bool runSdWriteProbe() {
     return false;
   }
 
-  probeFile.println("sd write ok");
+  const size_t written = probeFile.println("sd write ok");
+  probeFile.flush();
+  const bool writable = written == 13 && probeFile.size() == 13;
   probeFile.close();
   SD.remove(probePath);
-  return true;
+  return writable;
 }
 
 void clearPreviousRecordingFiles() {
@@ -1271,7 +1393,7 @@ void clearPreviousRecordingFiles() {
         entry = root.openNextFile();
         continue;
       }
-      if (name.endsWith(".wav") || name.endsWith(".WAV") || name == "/index.csv" || name == "index.csv") {
+      if (name.endsWith(".wav") || name.endsWith(".WAV") || name.endsWith(".flac") || name.endsWith(".FLAC") || name.endsWith(".mp3") || name.endsWith(".MP3") || name == "/index.csv" || name == "index.csv") {
         SD.remove(name.c_str());
       }
     }
@@ -1371,7 +1493,7 @@ String findSdTransferProbePath() {
       String lowerName = name;
       lowerName.toLowerCase();
       if (!name.startsWith("._") && !name.startsWith("/._") &&
-          lowerName.endsWith(".wav")) {
+          (lowerName.endsWith(".wav") || lowerName.endsWith(".flac") || lowerName.endsWith(".mp3"))) {
         selectedPath = name.startsWith("/") ? name : String("/") + name;
         entry.close();
         break;
@@ -1395,6 +1517,8 @@ bool remountSdAtFrequency(uint32_t frequency) {
 }
 
 bool enterTransferStorageMode(const String &probePath) {
+  RecorderLock recorderLock;
+  if (gSdRecoveryPending) return false;
   if (!gSdReady || !lockSd(pdMS_TO_TICKS(5000))) return false;
 
   String effectiveProbePath = probePath;
@@ -1466,10 +1590,12 @@ bool enterTransferStorageMode(const String &probePath) {
 
   gSdReady = mounted;
   unlockSd();
+  gTransferStorageActive = mounted;
   return mounted;
 }
 
 void leaveTransferStorageMode() {
+  gTransferStorageActive = false;
   if (gSdReady && gSdCurrentSpiFrequency == kSdSpiFrequency) return;
   if (!lockSd(pdMS_TO_TICKS(5000))) {
     Serial.println("WARN: could not restore recording SD speed");
@@ -1538,31 +1664,39 @@ bool setupGpsModule() {
   return true;
 }
 
-void stopRecording(const char *reason) {
+bool stopRecording(const char *reason) {
+  RecorderLock recorderLock;
+  gSdRecoveryPending = false;
+  gSaving = true;
   // Stop the recording task from beginning another SD write while the main
   // loop waits to finalize the WAV file.
   gState = RecorderState::Stopped;
   gConnectivity.setRecordingActive(false);
 
-  if (!gRecordingPath.isEmpty() && lockSd(pdMS_TO_TICKS(1000))) {
-    if (!finalizeRecordingFile()) {
-      Serial.printf("ERROR: failed to finalize WAV header for %s\n",
-                    gRecordingPath.c_str());
-    }
-    unlockSd();
+  bool saved = true;
+  if (!gRecordingPath.isEmpty()) {
+    saved = lockSd(pdMS_TO_TICKS(1000));
+    if (saved) { saved = finalizeRecordingFile(); unlockSd(); }
+  }
+  gSaving = false;
+  gSaveVisibleUntil = millis() + 200;
+  if (!saved) {
+    gState = RecorderState::Error;
+    gProblemIndicatorEnabled = true;
+    Serial.println("ERROR: WAV save failed; button action cancelled");
+    return false;
   }
 
   gProblemIndicatorEnabled = false;
-  gLastProblemIndicatorMs = millis();
-  logBuzzerPatternRequest("recording_stopped", 1, 40, 0);
-  startBuzzerPattern(1, 40, 0);
   Serial.printf("Recording stopped: %s. Bytes=%lu path=%s\n", reason,
                 static_cast<unsigned long>(gRecordingDataBytes), gRecordingPath.c_str());
   writeGpsStatusSnapshot(gGpsHasUtc ? "recording_stopped_with_fix" : "recording_stopped_without_fix");
   appendGpsHistoryEntry(gGpsHasUtc ? "recording_stopped_with_fix" : "recording_stopped_without_fix");
+  return true;
 }
 
 bool startRecording() {
+  RecorderLock recorderLock;
   if (!gSdReady) {
     Serial.println("ERROR: recording skipped because SD card is not ready");
     return false;
@@ -1595,17 +1729,31 @@ bool startRecording() {
     return false;
   }
 
+#if NEARNEST_RECORD_MP3
+  Serial.printf("MP3 memory: state_bytes=%u free_heap=%lu largest_block=%lu\n",
+                static_cast<unsigned int>(shine_encoder_state_size()),
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+  if (!gMp3Encoder.begin()) {
+    gRecordingFile.close();
+    unlockSd();
+    Serial.println("ERROR: could not allocate MP3 encoder; recording not started");
+    return false;
+  }
+#endif
   gRecordingDataBytes = 0;
+  gRecordingSamples = 0;
+  gRecordingEncodeUs = 0;
+  Serial.printf("Recording codec: %s sample_rate=16000 bits=16\n", NEARNEST_RECORD_MP3 ? "MP3 64 kbps mono" : NEARNEST_RECORD_FLAC ? "FLAC lossless" : "PCM WAV");
   gRecordingStartMs = millis();
   gLastHeaderSyncMs = gRecordingStartMs;
-  gLastHeartbeatMs = gRecordingStartMs;
   gLastRecordingProgressLogMs = gRecordingStartMs;
   gLastGpsPersistMs = gRecordingStartMs;
   gRecordingStartUtcResolved = false;
   gRecordingStartUtcMs = 0;
   gRecordingStartUtcIso = String();
   gGpsLockAnnounced = false;
-  gGpsFixBeepPlayed = false;
+  gGpsFixNotified = false;
   gFirstFixMetadataWritten = false;
   gRecordingGpsPointIndex = 0;
   gRecordingPublishedForTransfer = false;
@@ -1628,17 +1776,41 @@ bool startRecording() {
   writeRecordingMetadata();
   appendGpsHistoryEntry("recording_started");
   gState = RecorderState::Recording;
+  gSdRecoveryPending = false;
   gConnectivity.setRecordingActive(true);
   gProblemIndicatorEnabled = false;
-  logBuzzerPatternRequest("recording_started", 2, 120, 120);
-  startBuzzerPattern(2, 120, 120);
 
   Serial.printf("Recording started: %s start_millis=%lu\n", gRecordingPath.c_str(),
                 static_cast<unsigned long>(gRecordingStartMs));
   return true;
 }
 
-void failRecorder(const char *message) {
+bool recoverRecorderStorage() {
+  RecorderLock recorderLock;
+  gLastSdRecoveryMs = millis();
+  gSdRecoveryPending = true;
+  if (gTransferStorageActive) return false;
+  if (!lockSd(pdMS_TO_TICKS(100))) return false;
+  Serial.println("SD recovery: checking card before starting a new recording");
+  if (gRecordingFile) gRecordingFile.close();
+  SD.end();
+  delay(50);
+  gSdReady = setupSdCard();
+  if (gSdReady && !gRecordingPath.isEmpty()) {
+    if (!finalizeRecordingFile()) {
+      Serial.println("WARN: previous recording header could not be finalized; file preserved");
+    }
+  }
+  unlockSd();
+  if (!gSdReady || !startRecording()) {
+    Serial.println("SD recovery: not ready; retrying in 10 seconds");
+    return false;
+  }
+  Serial.println("SD recovery: recording resumed in a new file; outage audio was not captured");
+  return true;
+}
+
+void failRecorder(const char *message, bool recoverStorage = false) {
   if (!gRecordingPath.isEmpty() && lockSd(pdMS_TO_TICKS(1000))) {
     finalizeRecordingFile();
     unlockSd();
@@ -1647,22 +1819,19 @@ void failRecorder(const char *message) {
   gState = RecorderState::Error;
   gConnectivity.setRecordingActive(false);
   gProblemIndicatorEnabled = true;
-  gLastProblemIndicatorMs = millis();
-  logBuzzerPatternRequest(message, 1, 40, 0);
-  startBuzzerPattern(1, 40, 0);
+  gSdRecoveryPending = recoverStorage;
+  gLastSdRecoveryMs = millis();
 }
 
 void reportIssue(const char *message) {
   Serial.printf("ERROR: %s\n", message);
   gProblemIndicatorEnabled = true;
-  gLastProblemIndicatorMs = millis();
-  logBuzzerPatternRequest(message, 1, 40, 0);
-  startBuzzerPattern(1, 40, 0);
 }
 
 void setupHardware() {
-  pinMode(kBuzzerPin, OUTPUT);
-  setBuzzerLevel(false);
+  pinMode(kButtonPin, INPUT_PULLUP);
+  gButton.reset(millis(), digitalRead(kButtonPin) == LOW);
+
 
   if (!gSdMutex) {
     gSdMutex = xSemaphoreCreateMutex();
@@ -1688,11 +1857,16 @@ void setupHardware() {
 }
 
 void processRecording() {
-  int32_t rawSamples[kSamplesPerChunk];
-  int16_t pcmSamples[kSamplesPerChunk];
+  RecorderLock recorderLock;
+  if (gState != RecorderState::Recording) return;
+  // RecorderLock serializes access. Keep chunk buffers out of the task stack:
+  // FLAC adds another 1056 bytes, leaving too little room for SD checkpoints
+  // and their nested filesystem calls on the 6144-byte recording task stack.
+  static int32_t rawSamples[kSamplesPerChunk];
+  static int16_t pcmSamples[kSamplesPerChunk];
   size_t bytesRead = 0;
 
-  // Never let a disconnected or silent I2S device block GPS and buzzer service.
+  // Never let a disconnected or silent I2S device block GPS and LED service.
   esp_err_t err = i2s_read(I2S_NUM_0, rawSamples, sizeof(rawSamples), &bytesRead, 0);
   if (err == ESP_ERR_TIMEOUT || bytesRead == 0) {
     delay(1);
@@ -1705,11 +1879,17 @@ void processRecording() {
 
   const uint32_t now = millis();
   if (now - gLastRecordingProgressLogMs >= kRecordingProgressLogIntervalMs) {
-    // Serial.printf("Recorder alive: bytes=%lu sd_retry_events=%lu sd_retry_attempts=%lu sd_failures=%lu\n",
-    //               static_cast<unsigned long>(gRecordingDataBytes),
-    //               static_cast<unsigned long>(gSdRecoveredWriteEvents),
-    //               static_cast<unsigned long>(gSdRecoveredWriteAttempts),
-    //               static_cast<unsigned long>(gSdWriteFailureEvents));
+    Serial.printf("Recorder alive: bytes=%lu sd_retry_events=%lu sd_retry_attempts=%lu sd_failures=%lu stack_min_free_bytes=%lu\n",
+                  static_cast<unsigned long>(gRecordingDataBytes),
+                  static_cast<unsigned long>(gSdRecoveredWriteEvents),
+                  static_cast<unsigned long>(gSdRecoveredWriteAttempts),
+                  static_cast<unsigned long>(gSdWriteFailureEvents),
+                  static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)));
+    Serial.printf("Recording compression: samples=%llu pcm_bytes=%llu stored_bytes=%lu encode_ms=%llu\n",
+      static_cast<unsigned long long>(gRecordingSamples),
+      static_cast<unsigned long long>(gRecordingSamples * 2),
+      static_cast<unsigned long>(gRecordingDataBytes),
+      static_cast<unsigned long long>(gRecordingEncodeUs / 1000));
     gLastRecordingProgressLogMs = now;
     gSdRecoveredWriteEvents = 0;
     gSdRecoveredWriteAttempts = 0;
@@ -1728,12 +1908,29 @@ void processRecording() {
     // and produces harsh/distorted voice.
     const int32_t sample24 = rawSamples[i] >> 8;
     const int16_t sample16 = static_cast<int16_t>(sample24 >> 8);
-    pcmSamples[i] = cleanupAudioSample(sample16);
+    pcmSamples[i] = nest_audio::amplify(cleanupAudioSample(sample16), NEARNEST_AUDIO_GAIN_PERCENT);
   }
 
+#if NEARNEST_RECORD_MP3
+  const uint32_t encodeStartedUs = micros();
+  const bool encodedOk = gMp3Encoder.push(pcmSamples, sampleCount);
+  gRecordingEncodeUs += micros() - encodeStartedUs;
+  if (!encodedOk) { failRecorder("MP3 encoding failed"); return; }
+  const size_t pcmBytes = gMp3Encoder.available();
+  const uint8_t *writePtr = gMp3Encoder.data();
+#elif NEARNEST_RECORD_FLAC
+  static uint8_t encoded[kSamplesPerChunk * 2 + 32];
+  const uint32_t encodeStartedUs = micros();
+  const size_t pcmBytes = nest_flac::encode(pcmSamples, sampleCount, gRecordingSamples, encoded, sizeof(encoded));
+  gRecordingEncodeUs += micros() - encodeStartedUs;
+  if (!pcmBytes) { failRecorder("FLAC encoding failed"); return; }
+  const uint8_t *writePtr = encoded;
+#else
   const size_t pcmBytes = sampleCount * sizeof(int16_t);
+  const uint8_t *writePtr = reinterpret_cast<const uint8_t *>(pcmSamples);
+#endif
   if (!lockSd(pdMS_TO_TICKS(kSdWriteLockTimeoutMs))) {
-    failRecorder("Timed out waiting for SD access");
+    failRecorder("Timed out waiting for SD access", true);
     return;
   }
   if (gState != RecorderState::Recording) {
@@ -1741,7 +1938,6 @@ void processRecording() {
     return;
   }
 
-  const uint8_t *writePtr = reinterpret_cast<const uint8_t *>(pcmSamples);
   size_t totalWritten = 0;
   uint8_t writeAttempts = 0;
   bool neededRetry = false;
@@ -1757,7 +1953,12 @@ void processRecording() {
     writeAttempts++;
     neededRetry = true;
     delay(kSdWriteRetryDelayMs);
-    if (!reopenRecordingFileForWrite(gRecordingDataBytes + totalWritten)) {
+    const uint32_t resumeBytes = gRecordingDataBytes + totalWritten;
+    const bool reopened =
+        (writeAttempts % kSdWriteRemountEveryRetries == 0)
+            ? recoverRecordingSdForWrite(resumeBytes)
+            : reopenRecordingFileForWrite(resumeBytes);
+    if (!reopened) {
       continue;
     }
   }
@@ -1768,6 +1969,11 @@ void processRecording() {
                   static_cast<unsigned long>(writeElapsedMs),
                   static_cast<unsigned int>(pcmBytes));
   }
+#if NEARNEST_RECORD_MP3
+  gMp3Encoder.consume(totalWritten);
+  // Include partial SD writes so recovery resumes at the correct byte offset.
+  gRecordingDataBytes += totalWritten;
+#endif
   if (totalWritten != pcmBytes) {
     gSdWriteFailureEvents++;
     Serial.printf("WARN: SD write could not complete after retries wrote=%u expected=%u attempts=%u\n",
@@ -1775,7 +1981,7 @@ void processRecording() {
                   static_cast<unsigned int>(pcmBytes),
                   static_cast<unsigned int>(writeAttempts));
     unlockSd();
-    failRecorder("SD write failed while recording");
+    failRecorder("SD write failed while recording", true);
     return;
   }
 
@@ -1784,7 +1990,10 @@ void processRecording() {
     gSdRecoveredWriteAttempts += writeAttempts;
   }
 
+  gRecordingSamples += sampleCount;
+#if !NEARNEST_RECORD_MP3
   gRecordingDataBytes += totalWritten;
+#endif
 
   if (kHeaderSyncIntervalMs > 0 && (now - gLastHeaderSyncMs) >= kHeaderSyncIntervalMs) {
     if (!checkpointRecordingFile()) {
@@ -1799,15 +2008,6 @@ void processRecording() {
 
   unlockSd();
 
-  if (kRecordingHeartbeatMs > 0 && (now - gLastHeartbeatMs >= kRecordingHeartbeatMs)) {
-    logBuzzerPatternRequest("recording_heartbeat", 1, 40, 0);
-    startBuzzerPattern(1, 40, 0);
-    gLastHeartbeatMs = now;
-    Serial.printf("Recording... %lu bytes written start_utc=%s\n",
-                  static_cast<unsigned long>(gRecordingDataBytes),
-                  gRecordingStartUtcResolved ? gRecordingStartUtcIso.c_str() : "pending_gps_fix");
-  }
-
   persistGpsFilesIfDue(now, false);
 
   if (kMaxRecordingSeconds > 0 && (now - gRecordingStartMs) >= kMaxRecordingSeconds * 1000UL) {
@@ -1821,7 +2021,7 @@ void recordingTaskMain(void *parameter) {
   for (;;) {
     if (gState == RecorderState::Recording) {
       processRecording();
-      taskYIELD();
+      vTaskDelay(1);
       continue;
     }
     vTaskDelay(pdMS_TO_TICKS(2));
@@ -1831,6 +2031,14 @@ void recordingTaskMain(void *parameter) {
 }  // namespace
 
 void setup() {
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && gSleepWaitingForRelease) {
+    // The release is not an application wake: keep the LED off and re-arm
+    // for the next press before starting peripherals or recording tasks.
+    gSleepWaitingForRelease = false;
+    if (configureButtonWake(0)) esp_deep_sleep_start();
+  }
+  gSleepWaitingForRelease = false;
+  rtc_gpio_deinit(static_cast<gpio_num_t>(kButtonPin));
   Serial.begin(115200);
   delay(300);
 
@@ -1852,13 +2060,20 @@ void setup() {
                 __TIME__);
   Serial.printf("Mic pins: BCLK=%d WS=%d SD=%d\n", kI2sBclkPin, kI2sWsPin, kI2sDataInPin);
   Serial.printf("SD pins: CS=%d SCK=%d MISO=%d MOSI=%d\n", kSdCsPin, kSdSckPin, kSdMisoPin, kSdMosiPin);
-  Serial.printf("Buzzer pin: %d\n", kBuzzerPin);
   if (kGpsSerialLogsEnabled) {
     Serial.printf("GPS pins: RX=%d TX=%d baud=%lu\n", kGpsRxPin, kGpsTxPin,
                   static_cast<unsigned long>(kGpsBaudRates[gGpsBaudIndex]));
   }
 
+  gRecorderMutex = xSemaphoreCreateRecursiveMutex();
+  if (!gRecorderMutex) { Serial.println("FATAL: recorder mutex unavailable"); while (true) delay(1000); }
+  if (xTaskCreate(indicatorTaskMain, "indicator", 3072, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("FATAL: indicator task unavailable"); while (true) delay(1000);
+  }
   setupHardware();
+  if (xTaskCreate(buttonTaskMain, "button", 2048, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("FATAL: button task unavailable"); while (true) delay(1000);
+  }
   gConnectivity.begin(
       SD, gSdMutex, enterTransferStorageMode, leaveTransferStorageMode);
   xTaskCreatePinnedToCore(recordingTaskMain, "recordingTask", 6144, nullptr, 1, &gRecordingTaskHandle, 1);
@@ -1866,18 +2081,21 @@ void setup() {
     Serial.println("ERROR: failed to create recording task");
     gState = RecorderState::Error;
   }
-  logBuzzerPatternRequest("boot_complete", 1, 100, 0);
-  startBuzzerPattern(1, 100, 0);
 }
 
 void loop() {
   gConnectivity.service();
-  serviceBuzzer();
+  serviceButton();
   serviceGps();
-
-  if (gConnectivity.consumeStopRecordingRequest() &&
-      gState == RecorderState::Recording) {
-    stopRecording("sync requested");
+  if (gConnectivity.consumeStopRecordingRequest()) {
+    RecorderLock recorderLock;
+    gSdRecoveryPending = false;
+    if (gState == RecorderState::Recording) stopRecording("sync requested");
+  }
+  {
+    RecorderLock recorderLock;
+    if (gState == RecorderState::Error && gSdRecoveryPending &&
+        millis() - gLastSdRecoveryMs >= 10000) recoverRecorderStorage();
   }
 
   if (gConnectivity.consumeStartRecordingRequest()) {
@@ -1900,7 +2118,7 @@ void loop() {
       !gRecordingPublishedForTransfer &&
       !gRecordingPath.isEmpty()) {
     const uint64_t finalizedSize =
-        static_cast<uint64_t>(sizeof(WavHeader)) + gRecordingDataBytes;
+        static_cast<uint64_t>(kRecordingHeaderBytes) + gRecordingDataBytes;
     const String fileName =
         gRecordingPath.substring(gRecordingPath.lastIndexOf('/') + 1);
     const String recordingId = String("sd-") + fileName;
@@ -1910,14 +2128,6 @@ void loop() {
   }
 
   if (gState == RecorderState::Error || gState == RecorderState::Stopped) {
-    if (gProblemIndicatorEnabled && !gBuzzerActive) {
-      const uint32_t now = millis();
-      if (gLastProblemIndicatorMs == 0 ||
-          (now - gLastProblemIndicatorMs) >= kProblemIndicatorIntervalMs) {
-        startBuzzerPattern(1, 40, 0);
-        gLastProblemIndicatorMs = now;
-      }
-    }
     delay(10);
     return;
   }

@@ -9,6 +9,9 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <errno.h>
+// Match the recorder's legacy I2S driver; do not link Arduino ADC oneshot.
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 #include <fcntl.h>
 #include <esp_rom_crc.h>
 #include <esp_system.h>
@@ -47,7 +50,11 @@ constexpr size_t kUdpRecordingPayloadBytes =
     kUdpRecordingDatagramBytes - kUdpRecordingHeaderBytes;
 constexpr size_t kUdpRecordingPipelineBlockCount = 2;
 constexpr size_t kUdpRecordingReadBufferBytes =
-    kUdpRecordingPayloadBytes * 8;
+    kUdpRecordingPayloadBytes * 4;
+// Two 5632-byte buffers retain sector alignment and release 11264 bytes
+// of internal heap for Wi-Fi compared with the previous eight-packet blocks.
+static_assert(kUdpRecordingReadBufferBytes % 512 == 0,
+              "SD transfer blocks must remain sector aligned");
 constexpr size_t kUdpRecordingPipelineBufferBytes =
     kUdpRecordingPipelineBlockCount * kUdpRecordingReadBufferBytes;
 constexpr uint32_t kUdpRecordingMagic = 0x4e4e5552;  // "NNUR"
@@ -203,6 +210,16 @@ void udpRecordingTask(void *parameter) {
   uint32_t sentBytes = 0;
   uint32_t failedDatagrams = 0;
   uint32_t consumerWaitElapsedMs = 0;
+  uint64_t sendElapsedUs = 0;
+  uint32_t maxSendUs = 0;
+  uint32_t retryWaitMs = 0;
+  uint32_t noBufferErrors = 0, noMemoryErrors = 0, wouldBlockErrors = 0;
+  uint32_t otherSendErrors = 0, shortSends = 0;
+  int firstSendErrno = 0, lastSendErrno = 0;
+  uint32_t consecutiveFailures = 0, maxConsecutiveFailures = 0;
+  uint32_t lastProgressMs = millis();
+  uint32_t paceTicks = 0, peakPaceTicks = 0, pacedWaitMs = 0;
+  uint32_t cleanSends = 0;
   bool succeeded = false;
   const uint32_t startedAtMs = millis();
 
@@ -279,7 +296,9 @@ void udpRecordingTask(void *parameter) {
         static_cast<size_t>(readyBlock.index) *
             kUdpRecordingReadBufferBytes;
     size_t blockOffset = 0;
-    while (blockOffset < readyBlock.bytes && gTransferApActive) {
+    while (blockOffset < readyBlock.bytes && gTransferApActive &&
+           millis() - startedAtMs < 120000 &&
+           millis() - lastProgressMs < 5000) {
       const uint16_t payloadBytes = static_cast<uint16_t>(
           min(
               kUdpRecordingPayloadBytes,
@@ -296,25 +315,64 @@ void udpRecordingTask(void *parameter) {
           crc32(packet + kUdpRecordingHeaderBytes, payloadBytes));
       const size_t datagramBytes =
           kUdpRecordingHeaderBytes + payloadBytes;
+      const uint32_t sendStartedUs = micros();
       const ssize_t written = lwip_sendto(
           udpSocket, packet, datagramBytes, 0,
           reinterpret_cast<const sockaddr *>(&destination),
           sizeof(destination));
+      const int sendError = written < 0 ? errno : 0;
+      const uint32_t sendUs = micros() - sendStartedUs;
+      sendElapsedUs += sendUs;
+      maxSendUs = max(maxSendUs, sendUs);
       if (written != static_cast<ssize_t>(datagramBytes)) {
         ++failedDatagrams;
-        delay(1);
+        ++consecutiveFailures;
+        maxConsecutiveFailures = max(maxConsecutiveFailures, consecutiveFailures);
+        if (written >= 0) ++shortSends;
+        else {
+          if (!firstSendErrno) firstSendErrno = sendError;
+          lastSendErrno = sendError;
+          if (sendError == ENOBUFS) ++noBufferErrors;
+          else if (sendError == ENOMEM) ++noMemoryErrors;
+          else if (sendError == EAGAIN || sendError == EWOULDBLOCK) ++wouldBlockErrors;
+          else ++otherSendErrors;
+        }
+        // Let the network drain after allocation pressure. Cap burst pacing
+        // at four ticks per eight packets and relax it after sustained clean sends.
+        if (sendError == ENOMEM || sendError == ENOBUFS ||
+            sendError == EAGAIN || sendError == EWOULDBLOCK) {
+          if (consecutiveFailures == 1 || (consecutiveFailures % 8) == 0)
+            paceTicks = min(paceTicks + 1, static_cast<uint32_t>(4));
+          peakPaceTicks = max(peakPaceTicks, paceTicks);
+        }
+        cleanSends = 0;
+        const uint32_t retryStartedMs = millis();
+        vTaskDelay(1);
+        retryWaitMs += millis() - retryStartedMs;
         continue;
       }
+      consecutiveFailures = 0;
+      lastProgressMs = millis();
       blockOffset += payloadBytes;
       remaining -= payloadBytes;
       sentBytes += payloadBytes;
       ++sequence;
+      if (++cleanSends >= 128) {
+        if (paceTicks > 0) --paceTicks;
+        cleanSends = 0;
+      }
+      if (paceTicks > 0 && (sequence & 7U) == 0) {
+        const uint32_t paceStartedMs = millis();
+        vTaskDelay(paceTicks);
+        pacedWaitMs += millis() - paceStartedMs;
+      }
       // taskYIELD() only offers the core to another ready task at the same
       // priority. Block briefly so the idle task can service the watchdog
       // during sustained multi-megabyte transfers.
       if ((sequence & 255U) == 0) vTaskDelay(pdMS_TO_TICKS(1));
     }
     xQueueSend(freeBlocks, &readyBlock.index, 0);
+    if (blockOffset < readyBlock.bytes) break;
   }
 
   if (readerTask) {
@@ -359,6 +417,27 @@ void udpRecordingTask(void *parameter) {
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getMinFreeHeap()),
       succeeded ? "complete" : "interrupted");
+  Serial.printf(
+      "UDP send diagnostics: build=%s %s channel_config=%u "
+      "send_ms=%llu max_send_us=%lu retry_wait_ms=%lu "
+      "enobufs=%lu enomem=%lu would_block=%lu other_errors=%lu short_sends=%lu "
+      "first_errno=%d last_errno=%d max_consecutive_failures=%lu "
+      "remaining_bytes=%lu tick_ms=%lu\n",
+      __DATE__, __TIME__, static_cast<unsigned>(NEARNEST_TRANSFER_WIFI_CHANNEL),
+      static_cast<unsigned long long>(sendElapsedUs / 1000ULL),
+      static_cast<unsigned long>(maxSendUs), static_cast<unsigned long>(retryWaitMs),
+      static_cast<unsigned long>(noBufferErrors), static_cast<unsigned long>(noMemoryErrors),
+      static_cast<unsigned long>(wouldBlockErrors), static_cast<unsigned long>(otherSendErrors),
+      static_cast<unsigned long>(shortSends), firstSendErrno, lastSendErrno,
+      static_cast<unsigned long>(maxConsecutiveFailures),
+      static_cast<unsigned long>(remaining), static_cast<unsigned long>(portTICK_PERIOD_MS));
+  Serial.printf(
+      "UDP memory pacing: pipeline_bytes=%u paced_wait_ms=%lu "
+      "peak_pace_ticks=%lu final_pace_ticks=%lu largest_block=%lu\n",
+      static_cast<unsigned>(kUdpRecordingPipelineBufferBytes),
+      static_cast<unsigned long>(pacedWaitMs),
+      static_cast<unsigned long>(peakPaceTicks), static_cast<unsigned long>(paceTicks),
+      static_cast<unsigned long>(ESP.getMaxAllocHeap()));
   gTransferLastActivityMs = millis();
   gUdpRecordingTransferRunning = false;
   if (freeBlocks) vQueueDelete(freeBlocks);
@@ -535,8 +614,28 @@ void transferSdReaderTask(void *parameter) {
 
 int readBatteryPercent() {
 #if NEARNEST_BATTERY_ADC_PIN >= 0
-  const uint32_t pinMillivolts =
-      analogReadMilliVolts(NEARNEST_BATTERY_ADC_PIN);
+  static_assert(NEARNEST_BATTERY_ADC_PIN == 32,
+                "Update ADC1 channel mapping when changing the battery pin");
+  constexpr adc1_channel_t channel = ADC1_CHANNEL_4;
+  static esp_adc_cal_characteristics_t calibration{};
+  static bool ready = false;
+  if (!ready) {
+    pinMode(NEARNEST_BATTERY_ADC_PIN, INPUT);
+    if (adc1_config_width(ADC_WIDTH_BIT_12) != ESP_OK ||
+        adc1_config_channel_atten(channel, ADC_ATTEN_DB_11) != ESP_OK) {
+      return -1;
+    }
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11,
+                            ADC_WIDTH_BIT_12, 1100, &calibration);
+    ready = true;
+  }
+  uint32_t totalMillivolts = 0;
+  for (unsigned sample = 0; sample < 16; ++sample) {
+    const int raw = adc1_get_raw(channel);
+    if (raw < 0) return -1;
+    totalMillivolts += esp_adc_cal_raw_to_voltage(raw, &calibration);
+  }
+  const uint32_t pinMillivolts = totalMillivolts / 16;
   const uint32_t batteryMillivolts = static_cast<uint32_t>(
       pinMillivolts * NEARNEST_BATTERY_DIVIDER_RATIO);
   if (batteryMillivolts <= NEARNEST_BATTERY_EMPTY_MV) return 0;
@@ -550,6 +649,15 @@ int readBatteryPercent() {
 }
 
 uint8_t selectLeastBusyTransferChannel() {
+#if NEARNEST_TRANSFER_WIFI_CHANNEL != 0
+  static_assert(NEARNEST_TRANSFER_WIFI_CHANNEL == 1 ||
+                NEARNEST_TRANSFER_WIFI_CHANNEL == 6 ||
+                NEARNEST_TRANSFER_WIFI_CHANNEL == 11,
+                "Transfer channel must be 0 (auto), 1, 6, or 11");
+  Serial.printf("Transfer Wi-Fi fixed channel: %u (scan skipped)\n",
+                static_cast<unsigned>(NEARNEST_TRANSFER_WIFI_CHANNEL));
+  return NEARNEST_TRANSFER_WIFI_CHANNEL;
+#endif
   constexpr uint8_t channels[] = {1, 6, 11};
   uint32_t scores[] = {0, 0, 0};
   WiFi.mode(WIFI_STA);
@@ -618,15 +726,22 @@ String recordingFileName(const String &path) {
   return slash >= 0 ? path.substring(slash + 1) : path;
 }
 
-bool isWaveFileName(const String &fileName) {
+bool isRecordingFileName(const String &fileName) {
   String lower = fileName;
   lower.toLowerCase();
   return !fileName.isEmpty() && !fileName.startsWith("._") &&
-         lower.endsWith(".wav");
+         (lower.endsWith(".wav") || lower.endsWith(".flac") || lower.endsWith(".mp3"));
 }
 
-bool hasWaveHeader(File &file) {
-  if (!file || file.isDirectory() || file.size() <= 44) return false;
+const char *recordingContentType(String path) {
+  path.toLowerCase();
+  if (path.endsWith(".mp3")) return "audio/mpeg";
+  if (path.endsWith(".flac")) return "audio/flac";
+  return "audio/wav";
+}
+
+bool hasRecordingHeader(File &file) {
+  if (!file || file.isDirectory() || file.size() <= 42) return false;
 
   const size_t originalPosition = file.position();
   uint8_t header[12] = {};
@@ -634,7 +749,32 @@ bool hasWaveHeader(File &file) {
       file.seek(0) && file.read(header, sizeof(header)) == sizeof(header);
   file.seek(originalPosition);
 
-  return readHeader && header[0] == 'R' && header[1] == 'I' &&
+  if (!readHeader) return false;
+  // Raw MPEG Layer III frame (the on-device encoder writes no ID3 tag).
+  // Reject reserved/free-format fields and incomplete first frames.
+  if (header[0] == 0xff && (header[1] & 0xe0) == 0xe0) {
+    const unsigned version = (header[1] >> 3) & 3;
+    const unsigned layer = (header[1] >> 1) & 3;
+    const unsigned bitrateIndex = header[2] >> 4;
+    const unsigned rateIndex = (header[2] >> 2) & 3;
+    if (version == 1 || layer != 1 || bitrateIndex == 0 ||
+        bitrateIndex == 15 || rateIndex == 3 || (header[3] & 3) == 2) return false;
+    const unsigned mpeg1Rates[] = {44100, 48000, 32000};
+    const unsigned mpeg1Bitrates[] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320};
+    const unsigned mpeg2Bitrates[] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160};
+    const unsigned sampleRate = mpeg1Rates[rateIndex] / (version == 3 ? 1 : version == 2 ? 2 : 4);
+    const unsigned bitrate = version == 3 ? mpeg1Bitrates[bitrateIndex] : mpeg2Bitrates[bitrateIndex];
+    const unsigned frameBytes = (version == 3 ? 144000 : 72000) * bitrate / sampleRate + ((header[2] >> 1) & 1);
+    return file.size() >= frameBytes;
+  }
+  // Native FLAC begins with a 34-byte STREAMINFO metadata block. The
+  // recorder writes 42 header bytes; require audio data beyond that header.
+  if (header[0] == 'f' && header[1] == 'L' &&
+      header[2] == 'a' && header[3] == 'C') {
+    return (header[4] & 0x7f) == 0 && header[5] == 0 &&
+           header[6] == 0 && header[7] == 34;
+  }
+  return file.size() > 44 && header[0] == 'R' && header[1] == 'I' &&
          header[2] == 'F' && header[3] == 'F' && header[8] == 'W' &&
          header[9] == 'A' && header[10] == 'V' && header[11] == 'E';
 }
@@ -886,6 +1026,17 @@ void NearNestConnectivity::service() {
   handleCommand(command);
 }
 
+void NearNestConnectivity::enterPairingMode() {
+  if (!gBleServer) {
+    publishError("pairing.unavailable", "BLE has not been initialized");
+    return;
+  }
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  if (advertising && !advertising->isAdvertising()) advertising->start();
+  publishStatus("{\"event\":\"pairing.mode\",\"state\":\"ready\"}");
+  Serial.println("BLE pairing mode: advertising ready");
+}
+
 bool NearNestConnectivity::queueCommand(const String &json) {
   if (!gCommandQueue || json.isEmpty() || json.length() > kMaxCommandBytes) {
     return false;
@@ -1053,7 +1204,7 @@ void NearNestConnectivity::publishManifest(const String &requestedRecordingId) {
       String("{\"event\":\"recording.manifest\",\"recordingId\":\"") +
       jsonString(recordingId) + "\",\"fileName\":\"" +
       jsonString(recordingFileName(path)) +
-      "\",\"contentType\":\"audio/wav\",\"sizeBytes\":" +
+      "\",\"contentType\":\"" + String(recordingContentType(path)) + "\",\"sizeBytes\":" +
       String(static_cast<unsigned long long>(sizeBytes)) + "}");
 }
 
@@ -1081,7 +1232,7 @@ void NearNestConnectivity::publishNextRecording(const String &afterFileName) {
     while (entry) {
       if (!entry.isDirectory()) {
         const String fileName = recordingFileName(String(entry.name()));
-        if (isWaveFileName(fileName) && hasWaveHeader(entry) &&
+        if (isRecordingFileName(fileName) && hasRecordingHeader(entry) &&
             fileName.compareTo(afterFileName) > 0 &&
             (selectedFileName.isEmpty() ||
              fileName.compareTo(selectedFileName) < 0)) {
@@ -1106,7 +1257,7 @@ void NearNestConnectivity::publishNextRecording(const String &afterFileName) {
       String("{\"event\":\"recording.item\",\"recordingId\":\"") +
       jsonString(recordingIdForFileName(selectedFileName)) +
       "\",\"fileName\":\"" + jsonString(selectedFileName) +
-      "\",\"contentType\":\"audio/wav\",\"sizeBytes\":" +
+      "\",\"contentType\":\"" + String(recordingContentType(selectedFileName)) + "\",\"sizeBytes\":" +
       String(static_cast<unsigned long long>(selectedSizeBytes)) + "}");
 }
 
@@ -1116,7 +1267,7 @@ bool NearNestConnectivity::resolveRecording(const String &recordingId,
   constexpr char kRecordingIdPrefix[] = "sd-";
   if (!storage_ || !recordingId.startsWith(kRecordingIdPrefix)) return false;
   const String fileName = recordingId.substring(strlen(kRecordingIdPrefix));
-  if (!isWaveFileName(fileName) || fileName.indexOf('/') >= 0 ||
+  if (!isRecordingFileName(fileName) || fileName.indexOf('/') >= 0 ||
       fileName.indexOf('\\') >= 0 || fileName.indexOf("..") >= 0) {
     return false;
   }
@@ -1131,10 +1282,10 @@ bool NearNestConnectivity::resolveRecording(const String &recordingId,
     return false;
   }
   sizeBytes = static_cast<uint64_t>(file.size());
-  const bool validWave = hasWaveHeader(file);
+  const bool validRecording = hasRecordingHeader(file);
   file.close();
   if (storageMutex_) xSemaphoreGive(storageMutex_);
-  return validWave;
+  return validRecording;
 }
 
 void NearNestConnectivity::signChallenge(const String &payload) {

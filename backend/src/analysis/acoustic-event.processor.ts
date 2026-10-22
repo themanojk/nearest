@@ -121,8 +121,17 @@ export class AcousticEventProcessor extends WorkerHost {
         .select({ ranges: 1 })
         .lean()
         .exec();
-      if (chunks.length === 0) {
-        throw new Error('No completed processing chunks are available');
+      const processingChunks = chunks.map(chunk => ({
+        id: chunk._id.toString(), ranges: chunk.ranges,
+      }));
+      if (processingChunks.length === 0) {
+        if (claimed.scanStage?.status !== PipelineStageStatus.Completed ||
+            claimed.transcriptionSummary?.chunkCount !== 0) {
+          throw new Error('No completed processing chunks are available');
+        }
+        processingChunks.push(...nonSpeechAcousticChunks(
+          job.data.analysisId, claimed.mediaMetadata?.durationMs ?? 0,
+        ));
       }
 
       const sourceUrl = await this.storage.createReadUrl(job.data.objectKey);
@@ -130,8 +139,8 @@ export class AcousticEventProcessor extends WorkerHost {
       let processingSeconds = 0;
       let windowCount = 0;
       let modelName = '';
-      for (const [index, chunk] of chunks.entries()) {
-        const chunkId = chunk._id.toString();
+      for (const [index, chunk] of processingChunks.entries()) {
+        const chunkId = chunk.id;
         const result = await this.workerClient.detectAcousticEvents(
           job.data.analysisId,
           chunkId,
@@ -150,7 +159,7 @@ export class AcousticEventProcessor extends WorkerHost {
         );
         const progress = Math.max(
           1,
-          Math.min(99, Math.round(((index + 1) / chunks.length) * 100)),
+          Math.min(99, Math.round(((index + 1) / processingChunks.length) * 100)),
         );
         await this.analysisModel
           .updateOne(
@@ -186,7 +195,7 @@ export class AcousticEventProcessor extends WorkerHost {
       const summary: AcousticSummary = {
         model: modelName,
         processingSeconds: Math.round(processingSeconds * 1000) / 1000,
-        processedChunkCount: chunks.length,
+        processedChunkCount: processingChunks.length,
         windowCount,
         eventCount: events.length,
         healthEventCount: events.filter(
@@ -337,4 +346,16 @@ export function mergeAcousticEvents(
     (left, right) =>
       left.startMs - right.startMs || left.label.localeCompare(right.label),
   );
+}
+
+
+export function nonSpeechAcousticChunks(analysisId: string, durationMs: number) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    throw new Error('Audio duration is unavailable for non-speech analysis');
+  }
+  const chunks: Array<{ id: string; ranges: Array<{ startMs: number; endMs: number }> }> = [];
+  for (let startMs = 0; startMs < durationMs; startMs += 60000) {
+    chunks.push({ id: `${analysisId}-audio-${startMs}`, ranges: [{ startMs, endMs: Math.min(durationMs, startMs + 60000) }] });
+  }
+  return chunks;
 }

@@ -1,11 +1,10 @@
-import { Platform } from 'react-native';
 import * as Keychain from 'react-native-keychain';
 
-const API_BASE_URL =
-  Platform.OS === 'android'
-    ? 'http://127.0.0.1:9000/v1'
-    : 'http://127.0.0.1:9000/v1';
+const API_BASE_URL = 'http://192.168.31.188:3000/v1';
 const SESSION_SERVICE = 'app.nearnest.parent-session';
+const NETWORK_LOG = '[NearNest API]';
+
+console.info(`${NETWORK_LOG} configured base URL: ${API_BASE_URL}`);
 
 export type AuthUser = {
   email?: string;
@@ -85,14 +84,37 @@ async function apiRequest<T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...init,
-    headers: {
-      accept: 'application/json',
-      ...init?.headers,
-    },
-  });
-  return parseResponse<T>(response);
+  const url = `${API_BASE_URL}${path}`;
+  const method = init?.method ?? 'GET';
+  console.info(`${NETWORK_LOG} ${method} ${url}`);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        accept: 'application/json',
+        ...init?.headers,
+      },
+    });
+    console.info(
+      `${NETWORK_LOG} response ${response.status} ${response.statusText || ''}`.trim(),
+    );
+    try {
+      return await parseResponse<T>(response);
+    } catch (error) {
+      console.error(
+        `${NETWORK_LOG} API error ${method} ${path}:`,
+        error instanceof Error ? error.message : error,
+      );
+      throw error;
+    }
+  } catch (error) {
+    if (error instanceof TypeError) {
+      console.error(
+        `${NETWORK_LOG} network failure ${method} ${url}: ${error.message}`,
+      );
+    }
+    throw error;
+  }
 }
 
 export async function sendPhoneOtp(

@@ -1,5 +1,7 @@
-import React, { useCallback, useEffect, useRef } from 'react';
-import { View, Pressable } from 'react-native';
+import TransferLogs from '../components/TransferLogs';
+import { transferLog } from '../services/transferLog';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { View, Pressable, ScrollView } from 'react-native';
 import { colors, radii, shadows } from '../theme/theme';
 import { useAllowance, useStore } from '../state/store';
 import { transport, SyncHandle } from '../services/transport';
@@ -10,6 +12,10 @@ import Txt from '../components/Txt';
 import Icon from '../components/Icon';
 import ProgressBar from '../components/ProgressBar';
 import { PrimaryButton, GhostButton } from '../components/Buttons';
+import {
+  getCompletedRecordingIds,
+} from '../services/audioTransfer';
+import type { DeviceRecordingManifest } from '../services/transport';
 
 function Card({ children }: { children: React.ReactNode }) {
   return (
@@ -81,6 +87,49 @@ export default function SyncFlow() {
   const { state, patch, completeSync, resetSync } = useStore();
   const { remaining } = useAllowance();
   const handleRef = useRef<SyncHandle | null>(null);
+  const [catalog, setCatalog] = useState<DeviceRecordingManifest[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectionTouched, setSelectionTouched] = useState(false);
+
+  useEffect(() => {
+    if (state.syncStage !== 'preflight') return;
+    let active = true;
+    setCatalogLoading(true);
+    setCatalogError(null);
+    setSelectionTouched(false);
+    transferLog('CATALOG reading recordings from wearable');
+    void Promise.all([
+      transport.listRecordingManifests(),
+      getCompletedRecordingIds(),
+    ])
+      .then(([recordings, completed]) => {
+        if (!active) return;
+        const pending = recordings.filter((recording) => !completed.has(recording.recordingId));
+        for (const recording of recordings) {
+          transferLog(
+            `CATALOG ${recording.fileName} bytes=${recording.sizeBytes} ${completed.has(recording.recordingId) ? 'hidden: already uploaded' : 'shown: pending upload'}`,
+          );
+        }
+        transferLog(`CATALOG received=${recordings.length} shown=${pending.length} hidden=${recordings.length - pending.length}`);
+        setCatalog(pending);
+        setSelectedIds([]);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        transferLog(`CATALOG failed: ${error instanceof Error ? error.message : 'Could not read recordings'}`);
+        setCatalogError(
+          error instanceof Error ? error.message : 'Could not read recordings',
+        );
+      })
+      .finally(() => {
+        if (active) setCatalogLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [state.syncStage]);
 
   const stopTimers = useCallback(() => {
     handleRef.current?.cancel();
@@ -148,9 +197,9 @@ export default function SyncFlow() {
         onComplete: () => completeSync(),
         onFailed: (reason) =>
           patch({ syncError: reason, syncStage: 'failed' }),
-      });
+      }, selectionTouched ? { recordingIds: selectedIds } : undefined);
     },
-    [patch, completeSync],
+    [patch, completeSync, selectedIds, selectionTouched],
   );
 
   const cancel = useCallback(() => {
@@ -212,6 +261,68 @@ export default function SyncFlow() {
               This will use 1 sync once the transfer is confirmed. {Math.max(0, remaining - 1)}{' '}
               remain after.
             </Txt>
+            <Txt weight="semibold" size={13} color={colors.ink}>
+              Recordings to sync
+            </Txt>
+            {catalogLoading && (
+              <Txt size={12} color={colors.muted}>Reading pending recordings…</Txt>
+            )}
+            {!catalogLoading && catalog.length === 0 && !catalogError && (
+              <Txt size={12} color={colors.muted} lh={17}>
+                No pending recordings. Completed files are hidden automatically.
+              </Txt>
+            )}
+            {catalogError && (
+              <Txt size={12} color={colors.destructive} lh={17}>
+                {catalogError}
+              </Txt>
+            )}
+            {catalog.length > 0 && (
+              <ScrollView style={{ maxHeight: 150 }} contentContainerStyle={{ gap: 6 }}>
+                {catalog.map((recording) => {
+                  const checked = selectionTouched
+                    ? selectedIds.includes(recording.recordingId)
+                    : true;
+                  return (
+                    <Pressable
+                      key={recording.recordingId}
+                      onPress={() => {
+                        setSelectionTouched(true);
+                        setSelectedIds((current) =>
+                          current.includes(recording.recordingId)
+                            ? current.filter((id) => id !== recording.recordingId)
+                            : [...current, recording.recordingId],
+                        );
+                      }}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        gap: 9,
+                        padding: 9,
+                        borderRadius: 10,
+                        backgroundColor: 'rgba(61,122,84,0.08)',
+                      }}>
+                      <View
+                        style={{
+                          width: 18,
+                          height: 18,
+                          borderRadius: 5,
+                          borderWidth: 1,
+                          borderColor: checked ? colors.primaryGreenDark : colors.muted,
+                          backgroundColor: checked ? colors.primaryGreenDark : 'transparent',
+                        }}
+                      />
+                      <Txt size={12} color={colors.ink} numberOfLines={1} style={{ flex: 1 }}>
+                        {recording.fileName}
+                      </Txt>
+                      <Txt size={11} color={colors.muted}>
+                        {Math.ceil(recording.sizeBytes / (1024 * 1024))} MB
+                      </Txt>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            )}
             <PrimaryButton label="Start sync" onPress={beginSync} />
           </>
         )}
@@ -396,6 +507,7 @@ export default function SyncFlow() {
             <GhostButton label="Cancel" onPress={cancel} />
           </>
         )}
+        <TransferLogs />
       </Card>
     </Overlay>
   );

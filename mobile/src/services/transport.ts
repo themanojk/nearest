@@ -25,6 +25,7 @@ import type {
   Subscription,
 } from 'react-native-ble-plx';
 import { startDirectWifiSync } from './audioTransfer';
+import { transferLog } from './transferLog';
 
 export type SyncCallbacks = {
   onFileProgress: (completedFiles: number, totalFiles: number) => void;
@@ -44,6 +45,13 @@ export type SyncCallbacks = {
   onProcessingStep: (index: number) => void; // step 0..3 completed
   onComplete: () => void;
   onFailed: (reason: string) => void;
+};
+
+export type SyncOptions = {
+  /** Run the two 16 MiB network probes before copying; disabled for normal sync. */
+  runNetworkBenchmarks?: boolean;
+  /** Omitted means sync all not-yet-completed recordings; [] means none. */
+  recordingIds?: string[];
 };
 
 export type SyncHandle = { cancel: () => void };
@@ -109,7 +117,7 @@ export interface DeviceTransport {
   /** Contact the bonded device over BLE to compare firmware. */
   checkFirmware(): Promise<{ version: string; upToDate: boolean }>;
   /** Run the full transfer→upload→process pipeline. Returns a cancel handle. */
-  startSync(cbs: SyncCallbacks): SyncHandle;
+  startSync(cbs: SyncCallbacks, options?: SyncOptions): SyncHandle;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +209,7 @@ export class SimulatedTransport implements DeviceTransport {
     );
   }
 
-  startSync(cbs: SyncCallbacks): SyncHandle {
+  startSync(cbs: SyncCallbacks, _options?: SyncOptions): SyncHandle {
     const timers: ReturnType<typeof setTimeout>[] = [];
     const intervals: ReturnType<typeof setInterval>[] = [];
     let cancelled = false;
@@ -400,6 +408,7 @@ export class BleWifiTransport implements DeviceTransport {
     }
 
     if (!receivedReady) {
+      transferLog('CATALOG stop timed out; using single-recording firmware fallback');
       // Firmware before the multi-recording protocol exposes only the current
       // finalized recording. This keeps sync operational until it is flashed.
       let status: FirmwareStatus;
@@ -436,8 +445,12 @@ export class BleWifiTransport implements DeviceTransport {
           candidate.event === 'recording.item' ||
           candidate.event === 'recording.list_complete',
       );
-      if (status.event === 'recording.list_complete') break;
+      if (status.event === 'recording.list_complete') {
+        transferLog(`CATALOG wearable list complete: ${recordings.length} recordings`);
+        break;
+      }
       const recording = this.recordingFromStatus(status);
+      transferLog(`CATALOG wearable returned ${recording.fileName} bytes=${recording.sizeBytes}`);
       if (compareFirmwareStrings(recording.fileName, afterFileName) <= 0) {
         throw new Error(
           `Wearable returned a repeated or out-of-order recording catalog item: ${recording.fileName}`,
@@ -544,8 +557,8 @@ export class BleWifiTransport implements DeviceTransport {
     return { version: identity.firmwareVersion, upToDate: true };
   }
 
-  startSync(cbs: SyncCallbacks): SyncHandle {
-    const sync = startDirectWifiSync(this, cbs);
+  startSync(cbs: SyncCallbacks, options?: SyncOptions): SyncHandle {
+    const sync = startDirectWifiSync(this, cbs, options);
     return {
       cancel: () => {
         sync.cancel();

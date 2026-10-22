@@ -104,6 +104,7 @@ describe('AnalysisService', () => {
       add: jest.fn().mockResolvedValue(undefined),
     } as unknown as Queue<AggregateRiskJob>;
     const storage = {
+      deleteObject: jest.fn().mockResolvedValue(undefined),
       createUploadUrl: jest.fn().mockResolvedValue(upload),
       createMultipartUpload: jest.fn().mockResolvedValue('multipart-upload-a'),
       createMultipartPartUrl: jest.fn().mockImplementation(
@@ -118,6 +119,8 @@ describe('AnalysisService', () => {
       listMultipartParts: jest.fn().mockResolvedValue([]),
       completeMultipartUpload: jest.fn().mockResolvedValue(undefined),
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
+      ensureFlacPlayback: jest.fn().mockResolvedValue('converted/playback.wav'),
+      deleteFlacPlayback: jest.fn().mockResolvedValue(undefined),
       createPlaybackUrl: jest.fn().mockResolvedValue({
         url: 'http://object-store/playback',
         expiresAt: new Date('2026-07-24T13:00:00.000Z'),
@@ -153,6 +156,47 @@ describe('AnalysisService', () => {
       storage,
     };
   }
+
+  it('deletes owned terminal audio but preserves its diagnostic record', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    const { service, storage, model } = setup(document);
+    const result = await service.deleteAudio('tenant-a', document._id.toString());
+    expect(model.findOne).toHaveBeenCalledWith({ _id: document._id, tenantId: 'tenant-a' });
+    expect(storage.deleteObject).toHaveBeenCalledWith(document.sourceObjectKey);
+    expect(document.save).toHaveBeenCalled();
+    expect(result.audioDeletedAt).toBeInstanceOf(Date);
+    expect(model.deleteOne).not.toHaveBeenCalled();
+    await expect(service.getPlayback('tenant-a', document._id.toString())).rejects.toThrow('Audio has been deleted');
+    await service.deleteAudio('tenant-a', document._id.toString());
+    expect(storage.deleteObject).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects deletion during upload or processing', async () => {
+    const { service, storage } = setup();
+    await expect(service.deleteAudio('tenant-a', '66a111111111111111111111')).rejects.toThrow('Wait for upload');
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.scanStage.status = PipelineStageStatus.Running;
+    const running = setup(document);
+    await expect(running.service.deleteAudio('tenant-a', document._id.toString())).rejects.toThrow('Wait for upload');
+    expect(running.storage.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it('does not mark audio deleted when object storage fails', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    const { service, storage } = setup(document);
+    (storage.deleteObject as jest.Mock).mockRejectedValue(new Error('storage unavailable'));
+    await expect(service.deleteAudio('tenant-a', document._id.toString())).rejects.toThrow('storage unavailable');
+    expect(document.audioDeletedAt).toBeUndefined();
+    expect(document.save).not.toHaveBeenCalled();
+  });
+
+  it('does not delete audio outside the authenticated tenant', async () => {
+    const { service, model, storage } = setup();
+    (model.findOne as jest.Mock).mockReturnValue({ exec: jest.fn().mockResolvedValue(null) });
+    await expect(service.deleteAudio('tenant-b', '66a111111111111111111111')).rejects.toThrow();
+    expect(storage.deleteObject).not.toHaveBeenCalled();
+  });
 
   it('creates an awaiting-upload analysis and returns a signed URL', async () => {
     const { model, service, storage } = setup();
@@ -290,6 +334,47 @@ describe('AnalysisService', () => {
 
     expect(storage.assertObject).not.toHaveBeenCalled();
     expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('serves MP3 directly without FLAC conversion', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.contentType = 'audio/mpeg';
+    document.originalFileName = 'recording.mp3';
+    const { service, storage } = setup(document);
+    const result = await service.getPlayback('tenant-a', document._id.toString());
+    expect(storage.ensureFlacPlayback).not.toHaveBeenCalled();
+    expect(storage.createPlaybackUrl).toHaveBeenCalledWith(document.sourceObjectKey);
+    expect(result).toMatchObject({ contentType: 'audio/mpeg', fileName: 'recording.mp3' });
+  });
+
+  it('serves a compatible playback copy for existing FLAC imports', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.contentType = 'audio/flac';
+    document.originalFileName = 'recording.flac';
+    const { service, storage } = setup(document);
+    const result = await service.getPlayback('tenant-a', document._id.toString());
+    expect(storage.ensureFlacPlayback).toHaveBeenCalledWith(document.sourceObjectKey);
+    expect(storage.createPlaybackUrl).toHaveBeenCalledWith('converted/playback.wav');
+    expect(result).toMatchObject({ contentType: 'audio/wav', fileName: 'recording.wav' });
+    expect(document.contentType).toBe('audio/flac');
+  });
+
+  it('recognizes FLAC filenames when the upload MIME type is generic', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.contentType = 'application/octet-stream';
+    document.originalFileName = 'recording.FLAC';
+    const { service, storage } = setup(document);
+    await service.getPlayback('tenant-a', document._id.toString());
+    expect(storage.ensureFlacPlayback).toHaveBeenCalled();
+  });
+
+  it('deletes the FLAC playback copy along with the source audio', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.contentType = 'audio/flac';
+    const { service, storage } = setup(document);
+    await service.deleteAudio('tenant-a', document._id.toString());
+    expect(storage.deleteFlacPlayback).toHaveBeenCalledWith(document.sourceObjectKey);
+    expect(storage.deleteObject).toHaveBeenCalledWith(document.sourceObjectKey);
   });
 
   it('returns a tenant-scoped signed playback URL', async () => {

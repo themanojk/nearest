@@ -112,6 +112,14 @@ export class AnalysisController {
     return this.analysis.getById(tenantId, analysisId);
   }
 
+  @Delete(':analysisId/audio')
+  deleteAudio(
+    @CurrentUserId() tenantId: string,
+    @Param('analysisId') analysisId: string,
+  ): Promise<AnalysisResponse> {
+    return this.analysis.deleteAudio(tenantId, analysisId);
+  }
+
   @Get(':analysisId/playback')
   getPlayback(
     @CurrentUserId() tenantId: string,

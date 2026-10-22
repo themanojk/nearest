@@ -77,9 +77,9 @@ const recordings: DeviceRecordingManifest[] = [
     sizeBytes: 1_024,
   },
   {
-    contentType: 'audio/wav',
-    fileName: 'rec_0002.wav',
-    recordingId: 'sd-rec_0002.wav',
+    contentType: 'audio/mpeg',
+    fileName: 'rec_0002.mp3',
+    recordingId: 'sd-rec_0002.mp3',
     sizeBytes: 2_048,
   },
 ];
@@ -94,7 +94,11 @@ function completedAnalysis() {
   };
 }
 
-test('uploads and releases every finalized recording', async () => {
+test.each([false, true])('uploads and releases recordings with diagnostic benchmarks=%s', async (runNetworkBenchmarks) => {
+  jest.clearAllMocks();
+  await AsyncStorage.clear();
+  (localTransfer.benchmark as jest.Mock).mockClear();
+  (localTransfer.benchmarkUdp as jest.Mock).mockClear();
   const statusReads = new Map<string, number>();
   let created = 0;
   request.mockImplementation(async (path, init) => {
@@ -179,7 +183,7 @@ test('uploads and releases every finalized recording', async () => {
       uploaded.push(
         jobId.startsWith('analysis-1')
           ? 'sd-rec_0001.wav'
-          : 'sd-rec_0002.wav',
+          : 'sd-rec_0002.mp3',
       );
       return { bytes: 1 };
     },
@@ -193,13 +197,19 @@ test('uploads and releases every finalized recording', async () => {
       onProcessingStep: jest.fn(),
       onTransfer: jest.fn(),
       onUpload: jest.fn(),
-    });
+    }, runNetworkBenchmarks ? { runNetworkBenchmarks: true } : undefined);
   });
 
+  expect(localTransfer.benchmark).toHaveBeenCalledTimes(runNetworkBenchmarks ? 1 : 0);
+  expect(localTransfer.benchmarkUdp).toHaveBeenCalledTimes(runNetworkBenchmarks ? 1 : 0);
   expect(created).toBe(2);
+  const uploadRequests = request.mock.calls.filter(([path, init]) => path === '/audio-analysis' && init?.method === 'POST');
+  expect(JSON.parse(uploadRequests[1][1]?.body as string)).toMatchObject({
+    contentType: 'audio/mpeg', fileName: 'rec_0002.mp3', sizeBytes: 2048,
+  });
   expect(uploaded).toEqual([
     'sd-rec_0001.wav',
-    'sd-rec_0002.wav',
+    'sd-rec_0002.mp3',
   ]);
   expect(released).toEqual(uploaded);
   expect(request).not.toHaveBeenCalledWith(

@@ -387,19 +387,48 @@ export class AnalysisService {
     return this.toResponse(await this.findDocument(tenantId, analysisId));
   }
 
+  async deleteAudio(tenantId: string, analysisId: string): Promise<AnalysisResponse> {
+    const document = await this.findDocument(tenantId, analysisId);
+    if (document.audioDeletedAt) return this.toResponse(document);
+    const stages = [document.ingestStage, document.scanStage,
+      document.transcriptionStage, document.diarizationStage,
+      document.conversationStage, document.contextStage,
+      document.acousticStage, document.riskStage];
+    if (![AnalysisStatus.Completed, AnalysisStatus.Failed].includes(document.status) ||
+        stages.some(stage => stage && [PipelineStageStatus.Queueing,
+          PipelineStageStatus.Queued, PipelineStageStatus.Running].includes(stage.status))) {
+      throw new ConflictException('Wait for upload and processing to finish before deleting audio');
+    }
+    if (this.isFlacRecording(document)) {
+      await this.storage.deleteFlacPlayback(document.sourceObjectKey);
+    }
+    await this.storage.deleteObject(document.sourceObjectKey);
+    document.audioDeletedAt = new Date();
+    await document.save();
+    return this.toResponse(document);
+  }
+
   async getPlayback(
     tenantId: string,
     analysisId: string,
   ): Promise<AudioPlaybackResponse> {
     const document = await this.findDocument(tenantId, analysisId);
-    const playback = await this.storage.createPlaybackUrl(
-      document.sourceObjectKey,
-    );
+    if (document.audioDeletedAt) throw new NotFoundException('Audio has been deleted');
+    const flac = this.isFlacRecording(document);
+    const playbackKey = flac
+      ? await this.storage.ensureFlacPlayback(document.sourceObjectKey)
+      : document.sourceObjectKey;
+    const playback = await this.storage.createPlaybackUrl(playbackKey);
     return {
       ...playback,
-      contentType: document.contentType,
-      fileName: document.originalFileName,
+      contentType: flac ? 'audio/wav' : document.contentType,
+      fileName: flac ? document.originalFileName.replace(/\.flac$/i, '') + '.wav' : document.originalFileName,
     };
+  }
+
+  private isFlacRecording(document: { contentType: string; originalFileName: string }): boolean {
+    return /^(audio\/(x-)?flac)(;|$)/i.test(document.contentType) ||
+      /\.flac$/i.test(document.originalFileName);
   }
 
   async list(
@@ -968,6 +997,8 @@ export class AnalysisService {
       },
       contextSummary: document.contextSummary,
       contentType: document.contentType,
+      audioDeletedAt: document.audioDeletedAt,
+      failureReason: document.failureReason,
       createdAt: document.createdAt,
       fileName: document.originalFileName,
       diarizationStage: document.diarizationStage ?? {

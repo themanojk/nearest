@@ -1,9 +1,16 @@
+import { execFile } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   CreateBucketCommand,
   GetObjectCommand,
+  DeleteObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
   ListPartsCommand,
@@ -60,8 +67,11 @@ export class ObjectStorageService {
   private readonly readUrlTtlSeconds: number;
   private readonly uploadUrlTtlSeconds: number;
   private bucketPromise?: Promise<void>;
+  private readonly playbackConversions = new Map<string, Promise<string>>();
+  private readonly ffmpegPath: string;
 
   constructor(config: ConfigService) {
+    this.ffmpegPath = config.getOrThrow<string>('FFMPEG_PATH') || 'ffmpeg';
     this.bucket = config.getOrThrow<string>('S3_BUCKET');
     this.configureBucketCors = config.getOrThrow<boolean>(
       'S3_CONFIGURE_BUCKET_CORS',
@@ -117,7 +127,7 @@ export class ObjectStorageService {
 
   async createReadUrl(objectKey: string): Promise<string> {
     return getSignedUrl(
-      this.signingClient,
+      this.client,
       new GetObjectCommand({
         Bucket: this.bucket,
         Key: objectKey,
@@ -233,8 +243,91 @@ export class ObjectStorageService {
     );
   }
 
+  async deleteObject(objectKey: string): Promise<void> {
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+  }
+
+  playbackCopyKey(objectKey: string): string {
+    return `${objectKey}.playback-v1.wav`;
+  }
+
+  async ensureFlacPlayback(objectKey: string): Promise<string> {
+    const existing = this.playbackConversions.get(objectKey);
+    if (existing) return existing;
+    const pending = this.convertFlacPlayback(objectKey);
+    this.playbackConversions.set(objectKey, pending);
+    try {
+      return await pending;
+    } finally {
+      this.playbackConversions.delete(objectKey);
+    }
+  }
+
+  async deleteFlacPlayback(objectKey: string): Promise<void> {
+    // Do not leave a copy behind if deletion arrives during preparation.
+    await this.playbackConversions.get(objectKey)?.catch(() => undefined);
+    await this.deleteObject(this.playbackCopyKey(objectKey));
+  }
+
+  private async convertFlacPlayback(objectKey: string): Promise<string> {
+    const key = this.playbackCopyKey(objectKey);
+    try {
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      return key;
+    } catch (error) {
+      if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode !== 404) {
+        throw new BadGatewayException('Playback storage could not be checked');
+      }
+    }
+    const directory = await mkdtemp(join(tmpdir(), 'nearnest-playback-'));
+    try {
+      const output = join(directory, 'audio.wav');
+      // Older wearable firmware put 32 kHz in frame headers while its
+      // STREAMINFO correctly declared 16 kHz. Honor STREAMINFO without
+      // resampling, so those existing uploads keep their original timing.
+      const sourceHeader = await this.client.send(new GetObjectCommand({
+        Bucket: this.bucket, Key: objectKey, Range: 'bytes=0-41',
+      }));
+      const header = await sourceHeader.Body?.transformToByteArray();
+      if (!header || header.length < 42 ||
+          Buffer.from(header.subarray(0, 4)).toString('ascii') !== 'fLaC' ||
+          (header[4] & 0x7f) !== 0 || header[5] !== 0 || header[6] !== 0 || header[7] !== 34) {
+        throw new Error('Invalid FLAC STREAMINFO');
+      }
+      const sampleRate = (header[18] << 12) | (header[19] << 4) | (header[20] >> 4);
+      if (!sampleRate) throw new Error('Missing FLAC sample rate');
+      const input = await this.createReadUrl(objectKey);
+      await promisify(execFile)(this.ffmpegPath, [
+        '-nostdin', '-v', 'error', '-y', '-i', input,
+        '-map', '0:a:0', '-vn', '-af', `asetrate=${sampleRate}`,
+        '-c:a', 'pcm_s16le', output,
+      ], { timeout: 120_000, maxBuffer: 1024 * 1024 });
+      const info = await stat(output);
+      const body = createReadStream(output);
+      try {
+        await this.client.send(new PutObjectCommand({
+          Bucket: this.bucket, Key: key, Body: body,
+          ContentLength: info.size, ContentType: 'audio/wav',
+        }));
+      } finally {
+        body.destroy();
+      }
+      return key;
+    } catch {
+      // Do not expose ffmpeg stderr, which can contain signed source URLs.
+      throw new BadGatewayException('Audio playback preparation failed; please retry');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
   async createPlaybackUrl(objectKey: string): Promise<PresignedPlayback> {
-    const url = await this.createReadUrl(objectKey);
+    // Phones need the public endpoint; workers use createReadUrl's internal one.
+    const url = await getSignedUrl(
+      this.signingClient,
+      new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
+      { expiresIn: this.readUrlTtlSeconds },
+    );
     return {
       url,
       expiresAt: new Date(Date.now() + this.readUrlTtlSeconds * 1000),

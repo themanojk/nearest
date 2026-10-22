@@ -106,6 +106,7 @@ describe('AudioScanProcessor', () => {
         ? jest.fn().mockRejectedValue(workerError)
         : jest.fn().mockResolvedValue(workerResult),
     } as unknown as WorkerClientService;
+    const acousticQueue = { add: jest.fn().mockResolvedValue(undefined) };
     const processor = new AudioScanProcessor(
       analysisModel,
       segmentModel,
@@ -125,9 +126,11 @@ describe('AudioScanProcessor', () => {
           return values[key];
         }),
       } as unknown as ConfigService,
+      acousticQueue as unknown as Queue,
     );
 
     return {
+      acousticQueue,
       deleteMany,
       findOneAndUpdate,
       insertMany,
@@ -217,6 +220,14 @@ describe('AudioScanProcessor', () => {
         }),
       }),
     );
+  });
+
+  it('queues acoustic analysis even when the recording has no speech', async () => {
+    const { processor, workerClient, acousticQueue } = setup();
+    (workerClient.scanAudio as jest.Mock).mockResolvedValue({ ...workerResult, speechIntervals: [] });
+    await processor.process(job());
+    expect(acousticQueue.add).toHaveBeenCalledWith('detect', job().data,
+      expect.objectContaining({ jobId: `acoustic-${analysisId}-scan` }));
   });
 
   it('marks a terminal worker failure on the final attempt', async () => {

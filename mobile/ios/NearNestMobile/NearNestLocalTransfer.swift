@@ -1,10 +1,135 @@
 import Foundation
+import AVFoundation
 import NetworkExtension
 import React
 import Darwin
 
 @objc(NearNestLocalTransfer)
 final class NearNestLocalTransfer: RCTEventEmitter, URLSessionDataDelegate, URLSessionTaskDelegate {
+  private var debugPlayer: AVPlayer?
+  private var clipReadyObservation: NSKeyValueObservation?
+
+  @objc(playDebugAudio:resolver:rejecter:)
+  func playDebugAudio(_ source: String, resolver resolve: @escaping RCTPromiseResolveBlock,
+                      rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      guard let url = URL(string: source) else {
+        reject("audio.invalid_url", "Invalid audio URL", nil); return
+      }
+      self.clipReadyObservation = nil
+      do {
+        try AVAudioSession.sharedInstance().setCategory(.playback)
+        try AVAudioSession.sharedInstance().setActive(true)
+        self.debugPlayer?.pause()
+        self.debugPlayer = AVPlayer(url: url)
+        self.debugPlayer?.play()
+        resolve(nil)
+      } catch { reject("audio.play_failed", error.localizedDescription, error) }
+    }
+  }
+
+  @objc(playDebugAudioClip:startMs:endMs:resolver:rejecter:)
+  func playDebugAudioClip(_ source: String, startMs: Double, endMs: Double,
+                         resolver resolve: @escaping RCTPromiseResolveBlock,
+                         rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      guard let url = URL(string: source), startMs.isFinite, endMs.isFinite,
+            startMs >= 0, endMs > startMs else {
+        reject("audio.invalid_clip", "This moment has no valid audio timestamps", nil); return
+      }
+      self.clipReadyObservation = nil
+      do {
+        try AVAudioSession.sharedInstance().setCategory(.playback)
+        try AVAudioSession.sharedInstance().setActive(true)
+        self.debugPlayer?.pause()
+        let item = AVPlayerItem(url: url)
+        item.forwardPlaybackEndTime = CMTime(seconds: endMs / 1000, preferredTimescale: 1000)
+        let player = AVPlayer(playerItem: item)
+        self.debugPlayer = player
+        self.clipReadyObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
+          DispatchQueue.main.async {
+            guard let self = self, let player = player, self.debugPlayer === player,
+                  self.clipReadyObservation != nil else { return }
+            if item.status == .failed {
+              self.clipReadyObservation = nil
+              reject("audio.play_failed", item.error?.localizedDescription ?? "Could not load this moment", nil)
+              return
+            }
+            guard item.status == .readyToPlay else { return }
+            self.clipReadyObservation = nil
+            guard item.duration.seconds.isFinite, startMs < item.duration.seconds * 1000 else {
+              reject("audio.invalid_clip", "This moment is outside the available recording", nil); return
+            }
+            player.seek(to: CMTime(seconds: startMs / 1000, preferredTimescale: 1000),
+                        toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+              guard self.debugPlayer === player else { resolve(nil); return }
+              if finished { player.play(); resolve(nil) }
+              else { reject("audio.seek_failed", "Could not open this moment. Please retry.", nil) }
+            }
+          }
+        }
+      } catch { reject("audio.play_failed", error.localizedDescription, error) }
+    }
+  }
+
+  @objc(stopDebugAudio:rejecter:)
+  func stopDebugAudio(_ resolve: @escaping RCTPromiseResolveBlock,
+                      rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      self.clipReadyObservation = nil
+      self.debugPlayer?.pause()
+      self.debugPlayer = nil
+      try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+      resolve(nil)
+    }
+  }
+
+  @objc(seekDebugAudio:resolver:rejecter:)
+  func seekDebugAudio(_ positionMs: Double, resolver resolve: @escaping RCTPromiseResolveBlock,
+                      rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      guard let player = self.debugPlayer, let item = player.currentItem,
+            item.status == .readyToPlay, positionMs.isFinite, item.duration.seconds.isFinite else {
+        reject("audio.seek_failed", "Audio is not ready yet", nil); return
+      }
+      let seconds = min(max(0, positionMs / 1000), item.duration.seconds)
+      player.seek(to: CMTime(seconds: seconds, preferredTimescale: 1000)) { finished in
+        if finished { resolve(nil) }
+        else { reject("audio.seek_failed", "Seek interrupted", nil) }
+      }
+    }
+  }
+
+  @objc(setDebugAudioSpeed:resolver:rejecter:)
+  func setDebugAudioSpeed(_ speed: Double, resolver resolve: @escaping RCTPromiseResolveBlock,
+                         rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      guard speed.isFinite, speed >= 0.5, speed <= 4, let player = self.debugPlayer else {
+        reject("audio.speed_failed", "Invalid speed or no active audio", nil); return
+      }
+      player.currentItem?.audioTimePitchAlgorithm = .timeDomain
+      player.playImmediately(atRate: Float(speed))
+      resolve(nil)
+    }
+  }
+
+  @objc(getDebugAudioStatus:rejecter:)
+  func getDebugAudioStatus(_ resolve: @escaping RCTPromiseResolveBlock,
+                           rejecter reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.main.async {
+      let item = self.debugPlayer?.currentItem
+      let position = self.debugPlayer?.currentTime().seconds ?? 0
+      let duration = item?.duration.seconds ?? 0
+      resolve([
+        "error": item?.error?.localizedDescription as Any? ?? NSNull(),
+        "loading": item != nil && item?.status == .unknown,
+        "playing": (self.debugPlayer?.rate ?? 0) > 0,
+        "positionMs": position.isFinite ? position * 1000 : 0,
+        "durationMs": duration.isFinite ? duration * 1000 : 0
+      ])
+    }
+  }
+
   private final class TransferContext {
     enum Phase {
       case benchmark

@@ -1,4 +1,6 @@
-import React from 'react';
+import TransferLogs from '../../components/TransferLogs';
+import React, { useState } from 'react';
+import ImportedRecordingsScreen from './ImportedRecordingsScreen';
 import { ScrollView, Pressable } from 'react-native';
 import { colors, radii, spacing } from '../../theme/theme';
 import { useAllowance, useStore } from '../../state/store';
@@ -50,6 +52,8 @@ function BackHeader({ title, onBack }: { title: string; onBack: () => void }) {
 export default function ProfileScreen() {
   const { state, patch, clearHistory } = useStore();
   const { used, total, remaining, resets } = useAllowance();
+  const [showRecordings, setShowRecordings] = useState(false);
+  if (showRecordings) return <ImportedRecordingsScreen onBack={() => setShowRecordings(false)} />;
 
   // ---- Subscription -------------------------------------------------------
   if (state.profileView === 'subscription') {
@@ -114,6 +118,8 @@ export default function ProfileScreen() {
     <ScrollView
       contentContainerStyle={{ padding: spacing.gutter, paddingTop: 8, gap: 10 }}
       showsVerticalScrollIndicator={false}>
+      <TransferLogs />
+      <NavRow label="Imported recordings (debug)" onPress={() => setShowRecordings(true)} />
       <NavRow label="Subscription & allowance" onPress={() => patch({ profileView: 'subscription' })} />
       <NavRow label="Privacy & data" onPress={() => patch({ profileView: 'privacy' })} />
       <NavRow label="Notifications" onPress={() => patch({ notifPanelOpen: true })} />

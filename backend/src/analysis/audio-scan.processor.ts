@@ -6,12 +6,15 @@ import { Job, Queue } from 'bullmq';
 import { Model, Types } from 'mongoose';
 import { ObjectStorageService } from '../storage/storage.service';
 import {
+  ACOUSTIC_EVENT_JOB,
+  ACOUSTIC_EVENT_QUEUE,
   AUDIO_SCAN_JOB,
   AUDIO_SCAN_QUEUE,
   SPEECH_ASR_JOB,
   SPEECH_ASR_QUEUE,
 } from './analysis.constants';
 import {
+  DetectAcousticEventsJob,
   ScanAudioJob,
   ScanSummary,
   TranscribeAudioJob,
@@ -57,6 +60,8 @@ export class AudioScanProcessor extends WorkerHost {
     private readonly storage: ObjectStorageService,
     private readonly workerClient: WorkerClientService,
     config: ConfigService,
+    @InjectQueue(ACOUSTIC_EVENT_QUEUE)
+    private readonly acousticQueue: Queue<DetectAcousticEventsJob>,
   ) {
     super();
     this.trimmingOptions = {
@@ -188,10 +193,7 @@ export class AudioScanProcessor extends WorkerHost {
           {
             $set: {
               progress: 25,
-              status:
-                transcriptionChunks.length === 0
-                  ? AnalysisStatus.Completed
-                  : AnalysisStatus.Processing,
+              status: AnalysisStatus.Processing,
               scanSummary,
               'scanStage.status': PipelineStageStatus.Completed,
               'scanStage.progress': 100,
@@ -244,7 +246,7 @@ export class AudioScanProcessor extends WorkerHost {
                   }
                 : {}),
               ...(transcriptionChunks.length === 0
-                ? { completedAt: new Date(), progress: 100 }
+                ? { 'acousticStage.status': PipelineStageStatus.Queued }
                 : {}),
             },
           },
@@ -257,6 +259,14 @@ export class AudioScanProcessor extends WorkerHost {
           claimed.transcriptionLanguageMode ??
             TranscriptionLanguageMode.Auto,
         );
+      }
+      if (transcriptionChunks.length === 0) {
+        // Silence or non-speech still needs acoustic detection and risk aggregation.
+        await this.acousticQueue.add(ACOUSTIC_EVENT_JOB, job.data, {
+          jobId: `acoustic-${job.data.analysisId}-scan`, attempts: 3,
+          backoff: { type: 'exponential', delay: 5_000 },
+          removeOnComplete: 1000, removeOnFail: 5000,
+        });
       }
       this.logger.log(
         `scan.completed analysisId=${job.data.analysisId} pipelineVersion=${result.pipelineVersion} processingRegions=${processingRegions.length} retainedDurationMs=${retainedDurationMs}`,

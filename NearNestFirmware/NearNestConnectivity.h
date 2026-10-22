@@ -14,6 +14,7 @@ class NearNestConnectivity {
              EnterTransferStorageMode enterTransferStorageMode = nullptr,
              LeaveTransferStorageMode leaveTransferStorageMode = nullptr);
   void service();
+  void enterPairingMode();
 
   bool consumeStopRecordingRequest();
   bool consumeStartRecordingRequest();

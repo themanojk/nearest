@@ -24,7 +24,7 @@ async function bootstrap(): Promise<void> {
   });
 
   const port = config.getOrThrow<number>('BACKEND_PORT');
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
   const logger = new Logger('Bootstrap');
   logger.log(
     `backend.started port=${port} prefix=v1 logLevel=${configuredLogLevel}`,

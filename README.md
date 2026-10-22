@@ -25,6 +25,16 @@ directory when concrete shared code exists.
 - Docker with Compose
 - FFmpeg/FFprobe 7 or newer
 
+New firmware recordings use 16 kHz mono input (16-bit PCM), encoded on the ESP
+as 64 kbps MP3 for smaller transfers. Existing WAV and FLAC files remain supported.
+See `NearNestFirmware/README.md` for the MP3 trial and hardware checks.
+
+The backend also needs FFmpeg for mobile playback of FLAC recordings. Set
+`FFMPEG_PATH` if `ffmpeg` is not on its PATH. The first playback request creates
+a cached PCM WAV copy; later requests reuse it. Original FLAC uploads remain
+unchanged, and deleting audio removes both copies. Existing FLAC imports use
+this path automatically after restarting the updated backend.
+
 ## Getting started
 
 ```bash

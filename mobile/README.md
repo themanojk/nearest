@@ -16,14 +16,14 @@ returned by the backend without exposing its private key. The default
 signature.
 
 Bulk recordings never travel over BLE. The app creates a resumable multipart
-analysis upload for every finalized WAV on the SD card. The ESP creates a
+analysis upload for every finalized recording (MP3, FLAC, or WAV) on the SD card. The ESP creates a
 temporary one-client WPA2 hotspot with no internet route; its random password
 and request token are delivered over encrypted BLE. Android caches resumable
 10 MiB ranges, disconnects from that hotspot, and then uploads the cached parts
 through the phone's normal internet connection. Multiple recordings from the
 same day are queued separately. Persisted part status is stored server-side per
 recording, so retrying continues from missing parts instead of restarting a
-large recording. Once every queued WAV has reached durable object storage, the
+large recording. Once every queued recording has reached durable object storage, the
 app releases it from SD. The ESP remains idle after boot and after sync until
 the parent explicitly selects **Start recording** on the Device screen.
 
@@ -80,12 +80,14 @@ the fixed OTP `1234`. Access and rotating refresh tokens are stored through
 are restored on launch, refreshed once after an unauthorized API response, and
 revoked during logout.
 
-The current Android development API URL is `http://127.0.0.1:9000/v1`, matching
-the repository's local `BACKEND_PORT`. A USB-connected device needs ADB port
-forwarding for both the API and Metro:
+The current Android development API URL is `http://192.168.31.188:3000/v1`,
+using the laptop's LAN address so a phone connected to the same network can
+reach the backend. Keep the phone and laptop on the same Wi-Fi network. A
+USB-connected device can instead use ADB port forwarding for both the API and
+Metro:
 
 ```bash
-adb reverse tcp:9000 tcp:9000
+adb reverse tcp:3000 tcp:3000
 adb reverse tcp:8081 tcp:8081
 ```
 
@@ -100,7 +102,8 @@ A production build must supply a reachable HTTPS API endpoint before release.
   `react-native-ble-plx`.
 - `SimulatedTransport` — retained only for explicit UI previews and tests.
 
-Android uses a native Kotlin bridge with `WifiNetworkSpecifier`; iOS uses a
+Android 10+ uses a native Kotlin bridge with `WifiNetworkSpecifier`; Android 7+
+uses a legacy WPA2 configuration fallback. iOS uses a
 native Swift bridge with `NEHotspotConfigurationManager`. Both platforms stream
 file I/O natively, so progress reflects actual bytes. BLE carries control JSON
 only.
@@ -121,3 +124,40 @@ Nothing above this layer (sync flow, pairing UI) knows which transport is used.
 
 `DEV_OVERRIDE` at the top of `src/state/store.tsx` merges over the initial state
 to jump straight to any screen for visual work. It must be `{}` when shipping.
+
+### Temporary imported-recording debugger
+
+Open **Profile → Imported recordings (debug)** to browse the signed-in account's
+server imports across all children. Refresh and Load more cover the complete
+catalog, including pending/failed uploads. Each entry provides Play/Stop,
+playback position, file size/type, import time, analysis/child IDs, and expandable
+pipeline metadata and failure details. Internet access is required for playback.
+
+**Delete audio** permanently deletes the uploaded source object after confirmation;
+it retains reports and diagnostic metadata and does not delete wearable SD files.
+Deletion is available after upload and processing have stopped.
+
+Restart the updated backend and rebuild the native Android/iOS app for these
+controls. Metro reload alone cannot install the new native playback methods.
+
+## Risk review and moment playback
+
+Daily insights show priority, review coverage, recorded time, detected speech,
+conversation counts and health-related sound counts from analysis summaries.
+Missing metrics display a dash; dates refer to uploads. Model findings are
+review prompts, not confirmed events or diagnoses.
+
+Open **Review flagged moments** on a recording for explanations and timed
+risk incidents. **Listen to this moment** plays the original recording from
+startMs to endMs and stops at the boundary. Invalid timestamps fall back to
+full-recording guidance; deleted audio is unavailable. Full playback retains
+seeking and speed controls. Native clip support requires rebuilding both
+Android/iOS apps. Older builds with the existing seek method use a compatibility
+path: start playback, wait for metadata, then seek to the moment. This path may
+briefly play the beginning while loading and stops within the UI polling interval
+(about 500 ms). Rebuilt apps seek before playback and use native end boundaries.
+
+Android uses prepared/seek-complete callbacks and a 40 ms end check; iOS uses
+an exact seek and forwardPlaybackEndTime. Player timing can vary slightly by
+codec. Verify on device with MP3 and existing FLAC playback copies, slow
+network loading, switching cards, app backgrounding, and deleted recordings.

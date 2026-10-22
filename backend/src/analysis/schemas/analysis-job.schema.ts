@@ -69,6 +69,9 @@ export class AnalysisJob {
   @Prop({ required: true, unique: true })
   sourceObjectKey!: string;
 
+  @Prop()
+  audioDeletedAt?: Date;
+
   @Prop({ required: true })
   originalFileName!: string;
 

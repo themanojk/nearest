@@ -3,6 +3,11 @@ import Svg, { Path, Circle, Line, Polyline } from 'react-native-svg';
 import { colors } from '../theme/theme';
 
 export type IconName =
+  | 'play'
+  | 'stop'
+  | 'clock'
+  | 'chat'
+  | 'activity'
   | 'bell'
   | 'watch'
   | 'mic'
@@ -45,7 +50,12 @@ export default function Icon({
   };
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24">
-      {name === 'bell' && (
+      {name === 'play' && <Path d="m8 5 11 7-11 7Z" {...common} />}
+      {name === 'stop' && <Path d="M6 6h12v12H6Z" {...common} />}
+      {name === 'clock' && <><Circle cx={12} cy={12} r={9} {...common} /><Path d="M12 7v5l3 2" {...common} /></>}
+      {name === 'chat' && <Path d="M21 11a8 8 0 0 1-8 8H7l-5 3 2-6a8 8 0 1 1 17-5Z" {...common} />}
+      {name === 'activity' && <Path d="M2 12h4l3-8 6 16 3-8h4" {...common} />}
+      {name === 'bell'  && (
         <>
           <Path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" {...common} />
           <Path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" {...common} />

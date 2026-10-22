@@ -147,6 +147,11 @@ export const localTransfer = {
   getAvailableCacheBytes: () => nativeModule().getAvailableCacheBytes(),
   getCachedPart: (cacheKey: string, expectedBytes: number) =>
     nativeModule().getCachedPart(cacheKey, expectedBytes),
+  subscribeDiagnostics(listener: (event: { message: string }) => void): EmitterSubscription {
+    return new NativeEventEmitter(nativeModule()).addListener(
+      'NearNestTransferDiagnostic', listener,
+    );
+  },
   subscribe(
     listener: (event: ProgressEvent) => void,
   ): EmitterSubscription {

@@ -4,8 +4,11 @@ get_filename_component(
   ABSOLUTE
 )
 
+file(GLOB NEARNEST_SHINE_SOURCES "${NEARNEST_ARDUINO_SOURCE}/src/shine/*.c")
+
 idf_component_register(
   SRCS
+    ${NEARNEST_SHINE_SOURCES}
     "main.cpp"
     "${NEARNEST_ARDUINO_SOURCE}/NearNestConnectivity.cpp"
   INCLUDE_DIRS

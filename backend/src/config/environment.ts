@@ -8,6 +8,7 @@ interface Environment {
   ASR_MAX_CHUNK_MS: number;
   ASR_QUEUE_CONCURRENCY: number;
   BACKEND_PORT: number;
+  FFMPEG_PATH: string;
   FFPROBE_PATH: string;
   FFPROBE_TIMEOUT_MS: number;
   FRONTEND_ORIGIN: string;
@@ -139,6 +140,7 @@ export function validateEnvironment(
       2,
     ),
     BACKEND_PORT: numberValue(config, 'BACKEND_PORT', 3000),
+    FFMPEG_PATH: stringValue(config, 'FFMPEG_PATH', 'ffmpeg'),
     FFPROBE_PATH: stringValue(config, 'FFPROBE_PATH', 'ffprobe'),
     FFPROBE_TIMEOUT_MS: numberValue(config, 'FFPROBE_TIMEOUT_MS', 120_000),
     FRONTEND_ORIGIN: stringValue(

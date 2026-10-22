@@ -1,3 +1,4 @@
+import { transferLog } from './transferLog';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import { authenticatedRequest } from './auth';
@@ -5,11 +6,13 @@ import type {
   DeviceTransport,
   SyncCallbacks,
   SyncHandle,
+  SyncOptions,
 } from './transport';
 import { localTransfer } from './localTransfer';
 
 const PENDING_TRANSFER_KEY = 'nearnest.pending-wifi-transfer.v2';
 const LEGACY_PENDING_TRANSFER_KEY = 'nearnest.pending-wifi-transfer.v1';
+const COMPLETED_RECORDINGS_KEY = 'nearnest.completed-recording-ids.v1';
 
 export type DeviceRecordingManifest = {
   contentType: string;
@@ -34,6 +37,28 @@ export type WifiUploadPart = {
   partNumber: number;
   url: string;
 };
+
+export async function getCompletedRecordingIds(): Promise<Set<string>> {
+  const raw = await AsyncStorage.getItem(COMPLETED_RECORDINGS_KEY);
+  if (!raw) return new Set();
+  try {
+    const ids = JSON.parse(raw) as unknown;
+    return new Set(
+      Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+async function markCompletedRecording(recordingId: string): Promise<void> {
+  const completed = await getCompletedRecordingIds();
+  completed.add(recordingId);
+  await AsyncStorage.setItem(
+    COMPLETED_RECORDINGS_KEY,
+    JSON.stringify([...completed].slice(-1000)),
+  );
+}
 
 type MultipartStatus = {
   completedBytes: number;
@@ -149,8 +174,11 @@ const NETWORK_BENCHMARK_BYTES = 16 * 1024 * 1024;
 export function startDirectWifiSync(
   deviceTransport: DeviceTransport,
   callbacks: SyncCallbacks,
+  options?: SyncOptions,
 ): SyncHandle {
   let cancelled = false;
+  transferLog("SYNC started");
+  const diagnostics = localTransfer.subscribeDiagnostics?.(event => transferLog(event.message));
 
   const run = async () => {
     const devices = await authenticatedRequest<OwnedDevice[]>('/devices');
@@ -165,17 +193,25 @@ export function startDirectWifiSync(
     }
 
     callbacks.onTransfer(0);
-    const manifests = await deviceTransport.listRecordingManifests(
+    const allManifests = await deviceTransport.listRecordingManifests(
       (recordingsFound) => {
         callbacks.onTransfer(
           Math.min(0.05, recordingsFound / (recordingsFound + 1) / 20),
         );
       },
     );
-    callbacks.onFileProgress(0, manifests.length);
+    callbacks.onFileProgress(0, allManifests.length);
     if (cancelled) return;
 
-    const queue = await loadPendingQueue(device.childId, manifests);
+    const queue = await loadPendingQueue(device.childId, allManifests);
+    const completedIds = await getCompletedRecordingIds();
+    const selectedIds = new Set(options?.recordingIds ?? []);
+    const manifests = allManifests.filter(
+      (recording) =>
+        !completedIds.has(recording.recordingId) &&
+        (options?.recordingIds === undefined ||
+          selectedIds.has(recording.recordingId)),
+    );
     for (const recording of manifests) {
       if (
         queue.recordings.some(
@@ -198,13 +234,18 @@ export function startDirectWifiSync(
     }
 
     const catalogIds = new Set(
-      manifests.map((recording) => recording.recordingId),
+      allManifests.map((recording) => recording.recordingId),
     );
     for (const pending of queue.recordings) {
-      if (pending.phase !== 'processing' || pending.released) continue;
+      if (pending.phase !== 'processing') continue;
+      if (pending.released) {
+        await markCompletedRecording(pending.recording.recordingId);
+        continue;
+      }
       if (!catalogIds.has(pending.recording.recordingId)) {
         // A release acknowledgement may be lost after the ESP removed the file.
         pending.released = true;
+        await markCompletedRecording(pending.recording.recordingId);
         continue;
       }
       try {
@@ -212,6 +253,7 @@ export function startDirectWifiSync(
           pending.recording.recordingId,
         );
         pending.released = true;
+        await markCompletedRecording(pending.recording.recordingId);
       } catch {
         // Keep the completed analysis in the queue so this exact SD file is not
         // uploaded a second time. Release will be retried on the next sync.
@@ -232,7 +274,7 @@ export function startDirectWifiSync(
     const transferParts: TransferPart[] = [];
     for (const pending of queue.recordings) {
       if (pending.phase === 'processing') continue;
-      const recording = manifests.find(
+      const recording = allManifests.find(
         (candidate) =>
           candidate.recordingId === pending.recording.recordingId,
       );
@@ -343,10 +385,18 @@ export function startDirectWifiSync(
         );
       }
 
+      const handoffStartedAt = Date.now();
+      transferLog('Preparing wearable hotspot');
       const access = await deviceTransport.startLocalTransferAccessPoint();
+      transferLog(`Hotspot ready after ${Date.now() - handoffStartedAt} ms; joining Wi-Fi`);
       let hotspotConnected = false;
+      let lastProgressLogAt = 0;
       const progressSubscription = localTransfer.subscribe((event) => {
         if (event.phase !== 'download') return;
+        if (Date.now() - lastProgressLogAt >= 2000) {
+          transferLog(`DOWNLOAD progress job=${event.jobId} bytes=${event.bytesTransferred}/${event.totalBytes}`);
+          lastProgressLogAt = Date.now();
+        }
         const part = transferParts.find(
           (candidate) => candidate.cacheKey === event.jobId,
         );
@@ -363,60 +413,66 @@ export function startDirectWifiSync(
       try {
         await localTransfer.connect(access.ssid, access.password);
         hotspotConnected = true;
-        callbacks.onNetworkBenchmarkState?.(true);
-        let tcpBenchmarkBytesPerSecond = 0;
-        try {
-          const benchmark = await localTransfer.benchmark(
-            `${access.baseUrl}/v1/benchmark`,
-            access.token,
-            NETWORK_BENCHMARK_BYTES,
-          );
-          console.info(
-            `[NearNest transfer] RAM benchmark ${(
-              benchmark.bytesPerSecond /
-              (1024 * 1024)
-            ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms)`,
-          );
-          tcpBenchmarkBytesPerSecond = benchmark.bytesPerSecond;
-        } catch (error) {
-          console.warn(
-            '[NearNest transfer] TCP RAM benchmark unavailable',
-            error,
-          );
-        }
-        try {
-          const benchmark = await localTransfer.benchmarkUdp(
-            `${access.baseUrl}/v1/benchmark/udp`,
-            access.token,
-            NETWORK_BENCHMARK_BYTES,
-          );
-          console.info(
-            `[NearNest transfer] UDP RAM benchmark ${(
-              benchmark.bytesPerSecond /
-              (1024 * 1024)
-            ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms), ` +
-              `packets=${benchmark.packetsReceived}/${benchmark.packetsExpected}, ` +
-              `loss=${benchmark.packetLossPercent.toFixed(3)}%, ` +
-              `duplicates=${benchmark.duplicates}, ` +
-              `outOfOrder=${benchmark.outOfOrder}`,
-          );
-          callbacks.onNetworkBenchmark?.(
-            benchmark.bytesPerSecond,
-            benchmark.packetLossPercent,
-          );
-        } catch (error) {
-          console.warn(
-            '[NearNest transfer] UDP RAM benchmark unavailable',
-            error,
-          );
-          if (tcpBenchmarkBytesPerSecond > 0) {
-            callbacks.onNetworkBenchmark?.(tcpBenchmarkBytesPerSecond);
+        transferLog(`Wi-Fi connected after ${Date.now() - handoffStartedAt} ms; copying ${bytesNeeded} bytes`);
+        // These diagnostic probes transfer 32 MiB and do not select the transport.
+        if (options?.runNetworkBenchmarks === true) {
+          callbacks.onNetworkBenchmarkState?.(true);
+          let tcpBenchmarkBytesPerSecond = 0;
+          try {
+            const benchmark = await localTransfer.benchmark(
+              `${access.baseUrl}/v1/benchmark`,
+              access.token,
+              NETWORK_BENCHMARK_BYTES,
+            );
+            console.info(
+              `[NearNest transfer] RAM benchmark ${(
+                benchmark.bytesPerSecond /
+                (1024 * 1024)
+              ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms)`,
+            );
+            tcpBenchmarkBytesPerSecond = benchmark.bytesPerSecond;
+          } catch (error) {
+            console.warn(
+              '[NearNest transfer] TCP RAM benchmark unavailable',
+              error,
+            );
           }
-        } finally {
-          callbacks.onNetworkBenchmarkState?.(false);
+          try {
+            const benchmark = await localTransfer.benchmarkUdp(
+              `${access.baseUrl}/v1/benchmark/udp`,
+              access.token,
+              NETWORK_BENCHMARK_BYTES,
+            );
+            console.info(
+              `[NearNest transfer] UDP RAM benchmark ${(
+                benchmark.bytesPerSecond /
+                (1024 * 1024)
+              ).toFixed(2)} MB/s (${benchmark.elapsedMs} ms), ` +
+                `packets=${benchmark.packetsReceived}/${benchmark.packetsExpected}, ` +
+                `loss=${benchmark.packetLossPercent.toFixed(3)}%, ` +
+                `duplicates=${benchmark.duplicates}, ` +
+                `outOfOrder=${benchmark.outOfOrder}`,
+            );
+            callbacks.onNetworkBenchmark?.(
+              benchmark.bytesPerSecond,
+              benchmark.packetLossPercent,
+            );
+          } catch (error) {
+            console.warn(
+              '[NearNest transfer] UDP RAM benchmark unavailable',
+              error,
+            );
+            if (tcpBenchmarkBytesPerSecond > 0) {
+              callbacks.onNetworkBenchmark?.(tcpBenchmarkBytesPerSecond);
+            }
+          } finally {
+            callbacks.onNetworkBenchmarkState?.(false);
+          }
         }
         for (const part of partsToDownload) {
           if (cancelled) return;
+          const partStartedAt = Date.now();
+          transferLog(`DOWNLOAD start job=${part.cacheKey} file=${part.pending.recording.fileName} part=${part.partNumber} offset=${part.offsetBytes} bytes=${part.lengthBytes}`);
           const query =
             `recordingId=${encodeURIComponent(
               part.pending.recording.recordingId,
@@ -432,6 +488,7 @@ export function startDirectWifiSync(
                 part.cacheKey,
               );
               part.path = hybrid.path;
+              transferLog(`UDP result file=${part.pending.recording.fileName} part=${part.partNumber} rateKiBs=${(hybrid.udpBytesPerSecond / 1024).toFixed(1)} lossPct=${hybrid.packetLossPercent.toFixed(3)} missingPackets=${hybrid.missingPackets} repairedBytes=${hybrid.repairedBytes}`);
               console.info(
                 `[NearNest transfer] UDP recording part ${(
                   hybrid.udpBytesPerSecond /
@@ -446,6 +503,7 @@ export function startDirectWifiSync(
                 '[NearNest transfer] UDP recording part failed; falling back to TCP',
                 error,
               );
+              transferLog(`UDP failed; retrying part over TCP: ${error instanceof Error ? error.message : String(error)}`);
               part.path = await localTransfer.downloadRange(
                 part.cacheKey,
                 tcpUrl,
@@ -463,6 +521,7 @@ export function startDirectWifiSync(
               part.cacheKey,
             );
           }
+          transferLog(`DOWNLOAD complete file=${part.pending.recording.fileName} part=${part.partNumber} elapsedMs=${Date.now() - partStartedAt}`);
           transferredBytes.set(part.cacheKey, part.lengthBytes);
           reportTransferProgress();
         }
@@ -478,7 +537,9 @@ export function startDirectWifiSync(
     }
     if (cancelled) return;
     callbacks.onTransfer(1);
+    transferLog("Waiting for internet after wearable download");
     await localTransfer.waitForInternet();
+    transferLog("Internet ready; uploading cached audio");
 
     const totalBytes = Math.max(
       1,
@@ -519,7 +580,7 @@ export function startDirectWifiSync(
     for (const pending of queue.recordings) {
       if (cancelled) return;
       if (pending.phase === 'processing') continue;
-      const recording = manifests.find(
+      const recording = allManifests.find(
         (candidate) =>
           candidate.recordingId === pending.recording.recordingId,
       );
@@ -603,11 +664,14 @@ export function startDirectWifiSync(
               );
             }
             const jobId = `${transfer.analysisId}-${uploadPart.partNumber}`;
+            const uploadStartedAt = Date.now();
+            transferLog(`UPLOAD start file=${recording.fileName} part=${uploadPart.partNumber} bytes=${uploadPart.lengthBytes}`);
             await localTransfer.uploadFile(
               jobId,
               uploadPart.url,
               cachedPart.path,
             );
+            transferLog(`UPLOAD complete file=${recording.fileName} part=${uploadPart.partNumber} elapsedMs=${Date.now() - uploadStartedAt}`);
           }
         } finally {
           progressSubscription.remove();
@@ -647,6 +711,7 @@ export function startDirectWifiSync(
       await savePendingQueue(queue);
       reportFileProgress();
       reportUploadProgress();
+      await markCompletedRecording(recording.recordingId);
       try {
         await deviceTransport.releaseRecording(recording.recordingId);
         pending.released = true;
@@ -664,6 +729,7 @@ export function startDirectWifiSync(
       (pending) => !pending.released,
     );
     await savePendingQueue(queue);
+    transferLog("SYNC complete");
     callbacks.onComplete();
   };
 
@@ -671,13 +737,16 @@ export function startDirectWifiSync(
     if (!cancelled) {
       const reason =
         error instanceof Error ? error.message : 'Wi-Fi sync failed';
+      transferLog(`SYNC failed: ${reason}`);
       console.error(`[NearNest sync] ${reason}`);
       callbacks.onFailed(reason);
     }
-  });
+  }).finally(() => diagnostics?.remove());
 
   return {
     cancel: () => {
+      transferLog("SYNC cancelled");
+      diagnostics?.remove();
       cancelled = true;
       void localTransfer.cancelAll().catch(() => undefined);
       void localTransfer.disconnect().catch(() => undefined);

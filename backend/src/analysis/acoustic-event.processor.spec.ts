@@ -1,4 +1,4 @@
-import { mergeAcousticEvents } from './acoustic-event.processor';
+import { mergeAcousticEvents, nonSpeechAcousticChunks } from './acoustic-event.processor';
 
 describe('mergeAcousticEvents', () => {
   it('merges adjacent detections with the same label', () => {
@@ -50,4 +50,11 @@ describe('mergeAcousticEvents', () => {
       ]),
     ).toHaveLength(2);
   });
+});
+
+test('covers non-speech recordings in bounded continuous audio windows', () => {
+  expect(nonSpeechAcousticChunks('analysis', 125000).map(chunk => chunk.ranges[0])).toEqual([
+    {startMs: 0, endMs: 60000}, {startMs: 60000, endMs: 120000}, {startMs: 120000, endMs: 125000},
+  ]);
+  expect(() => nonSpeechAcousticChunks('analysis', 0)).toThrow();
 });

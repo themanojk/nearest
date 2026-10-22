@@ -6,6 +6,8 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiNetworkSpecifier
+import android.net.wifi.WifiConfiguration
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
 import com.facebook.react.bridge.Arguments
@@ -44,24 +46,191 @@ class NearNestLocalTransferModule(
   private val cacheRoot = File(context.cacheDir, "nearnest-transfer")
 
   @Volatile private var networkCallback: ConnectivityManager.NetworkCallback? = null
+  @Volatile private var legacyWifiNetworkId: Int? = null
+  private var transferWifiLock: WifiManager.WifiLock? = null
+
+  @Suppress("DEPRECATION")
+  @Synchronized
+  private fun holdTransferWifiLock() {
+    if (transferWifiLock?.isHeld == true) return
+    val manager = context.applicationContext.getSystemService(WifiManager::class.java)
+      ?: throw IllegalStateException("Android Wi-Fi service is unavailable")
+    transferWifiLock = manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+      "NearNest:audio-transfer").apply { setReferenceCounted(false); acquire() }
+    emitDiagnostic("High-performance Wi-Fi lock acquired")
+  }
+
+  @Synchronized
+  private fun releaseTransferWifiLock() {
+    transferWifiLock?.let { if (it.isHeld) it.release() }
+    transferWifiLock = null
+  }
 
   override fun getName(): String = "NearNestLocalTransfer"
 
+  private val audioHandler = android.os.Handler(android.os.Looper.getMainLooper())
+  private var audioPlayer: android.media.MediaPlayer? = null
+  private var audioSpeed = 1f
+  private var audioReady = false
+  private var audioError: String? = null
+
+  @ReactMethod
+  fun playDebugAudio(url: String, promise: Promise) {
+    audioHandler.post {
+      audioPlayer?.release()
+      audioPlayer = null
+      audioReady = false
+      audioError = null
+      audioSpeed = 1f
+      try {
+        val player = android.media.MediaPlayer()
+        audioPlayer = player
+        player.setAudioAttributes(android.media.AudioAttributes.Builder()
+          .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+          .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build())
+        player.setOnPreparedListener {
+          if (audioPlayer === it) { audioReady = true; it.playbackParams = android.media.PlaybackParams().setSpeed(audioSpeed); it.start() }
+        }
+        player.setOnErrorListener { _, what, extra ->
+          audioError = "Audio playback failed ($what/$extra). Try Play again."
+          audioReady = false
+          true
+        }
+        player.setDataSource(url)
+        player.prepareAsync()
+        promise.resolve(null)
+      } catch (error: Exception) {
+        audioPlayer?.release()
+        audioPlayer = null
+        promise.reject("audio.play_failed", error.message, error)
+      }
+    }
+  }
+
+  @ReactMethod
+  fun playDebugAudioClip(url: String, startMs: Double, endMs: Double, promise: Promise) {
+    audioHandler.post {
+      if (!startMs.isFinite() || !endMs.isFinite() || startMs < 0 || endMs <= startMs) {
+        promise.reject("audio.invalid_clip", "This moment has no valid audio timestamps")
+        return@post
+      }
+      audioPlayer?.release()
+      audioPlayer = null
+      audioReady = false
+      audioError = null
+      audioSpeed = 1f
+      try {
+        val player = android.media.MediaPlayer()
+        audioPlayer = player
+        player.setAudioAttributes(android.media.AudioAttributes.Builder()
+          .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+          .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build())
+        player.setOnPreparedListener {
+          if (audioPlayer !== it) return@setOnPreparedListener
+          if (startMs >= it.duration) {
+            audioError = "This moment is outside the available recording"
+            return@setOnPreparedListener
+          }
+          val stopAt = endMs.coerceAtMost(it.duration.toDouble()).toInt()
+          it.setOnSeekCompleteListener { readyPlayer ->
+            if (audioPlayer === readyPlayer) {
+              readyPlayer.setOnSeekCompleteListener(null)
+              audioReady = true
+              readyPlayer.start()
+              audioHandler.post(object : Runnable {
+                override fun run() {
+                  if (audioPlayer !== readyPlayer || !audioReady) return
+                  if (readyPlayer.currentPosition >= stopAt) readyPlayer.pause()
+                  else audioHandler.postDelayed(this, 40)
+                }
+              })
+            }
+          }
+          if (android.os.Build.VERSION.SDK_INT >= 26) it.seekTo(startMs.toLong(), android.media.MediaPlayer.SEEK_CLOSEST)
+          else it.seekTo(startMs.toInt())
+        }
+        player.setOnErrorListener { _, _, _ ->
+          if (audioPlayer === player) { audioError = "Could not play this moment. Please retry."; audioReady = false }
+          true
+        }
+        player.setDataSource(url)
+        player.prepareAsync()
+        promise.resolve(null)
+      } catch (error: Exception) {
+        audioPlayer?.release(); audioPlayer = null
+        promise.reject("audio.play_failed", error.message, error)
+      }
+    }
+  }
+
+  @ReactMethod
+  fun stopDebugAudio(promise: Promise) {
+    audioHandler.post {
+      audioPlayer?.release()
+      audioPlayer = null
+      audioReady = false
+      audioError = null
+      promise.resolve(null)
+    }
+  }
+
+  @ReactMethod
+  fun seekDebugAudio(positionMs: Double, promise: Promise) {
+    audioHandler.post {
+      try {
+        val player = audioPlayer
+        check(audioReady && player != null) { "Audio is not ready yet" }
+        player.seekTo(positionMs.coerceIn(0.0, player.duration.toDouble()).toInt())
+        promise.resolve(null)
+      } catch (error: Exception) { promise.reject("audio.seek_failed", error.message, error) }
+    }
+  }
+
+  @ReactMethod
+  fun setDebugAudioSpeed(speed: Double, promise: Promise) {
+    audioHandler.post {
+      try {
+        require(speed.isFinite() && speed in 0.5..4.0) { "Invalid playback speed" }
+        if (audioReady) audioPlayer?.let {
+          it.playbackParams = android.media.PlaybackParams().setSpeed(speed.toFloat()).setPitch(1f)
+        }
+        audioSpeed = speed.toFloat()
+        promise.resolve(null)
+      } catch (error: Exception) { promise.reject("audio.speed_failed", error.message, error) }
+    }
+  }
+
+  @ReactMethod
+  fun getDebugAudioStatus(promise: Promise) {
+    audioHandler.post {
+      val result = Arguments.createMap()
+      result.putString("error", audioError)
+      result.putBoolean("loading", audioPlayer != null && !audioReady && audioError == null)
+      result.putBoolean("playing", audioReady && audioPlayer?.isPlaying == true)
+      result.putDouble("positionMs", if (audioReady) audioPlayer!!.currentPosition.toDouble() else 0.0)
+      result.putDouble("durationMs", if (audioReady) audioPlayer!!.duration.toDouble() else 0.0)
+      promise.resolve(result)
+    }
+  }
+
   @ReactMethod
   fun connectToHotspot(ssid: String, password: String, promise: Promise) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-      promise.reject(
-        "wifi.unsupported",
-        "NearNest hotspot transfer requires Android 10 or newer",
-      )
-      return
-    }
     if (ssid.isBlank() || password.length !in 8..63) {
       promise.reject("wifi.invalid_credentials", "Invalid hotspot credentials")
       return
     }
 
     disconnectInternal()
+    try {
+      holdTransferWifiLock()
+    } catch (error: Exception) {
+      promise.reject("wifi.performance_lock_failed", error.message, error)
+      return
+    }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+      connectLegacyHotspot(ssid, password, promise)
+      return
+    }
     val specifier =
       WifiNetworkSpecifier.Builder()
         .setSsid(ssid)
@@ -108,7 +277,7 @@ class NearNestLocalTransferModule(
     try {
       connectivityManager.requestNetwork(request, callback, 30_000)
     } catch (error: Exception) {
-      networkCallback = null
+      disconnectInternal()
       promise.reject("wifi.request_failed", error.message, error)
     }
   }
@@ -577,7 +746,8 @@ class NearNestLocalTransferModule(
               socket.receive(datagram)
             } catch (_: SocketTimeoutException) {
               if (endReceivedAtNanos > 0 &&
-                  System.nanoTime() - endReceivedAtNanos >= 500_000_000L) {
+                  System.nanoTime() - endReceivedAtNanos >=
+                    (if (packetsReceived == packetsExpected) 50_000_000L else 500_000_000L)) {
                 break
               }
               continue
@@ -596,6 +766,7 @@ class NearNestLocalTransferModule(
             if ((flags and 1) != 0) {
               if (endReceivedAtNanos == 0L) {
                 endReceivedAtNanos = System.nanoTime()
+                socket.soTimeout = 50
               }
               continue
             }
@@ -647,6 +818,7 @@ class NearNestLocalTransferModule(
             throw IllegalStateException("Wearable UDP range did not complete")
           }
 
+          emitDiagnostic("UDP received job=$jobId packets=$packetsReceived/$packetsExpected bytes=$udpBytes/$length corrupt=$corruptPackets; starting TCP repair")
           val originalOffset =
             requestedUri.getQueryParameter("offsetBytes")?.toLongOrNull()
               ?: throw IllegalStateException("UDP range offset is missing")
@@ -658,6 +830,7 @@ class NearNestLocalTransferModule(
               ?: throw IllegalStateException("UDP repair path is invalid")
           var repairedBytes = 0L
           var missingPackets = 0
+          var repairRequests = 0
           var sequence = 0
           while (sequence < packetsExpected) {
             if (seen[sequence]) {
@@ -677,6 +850,10 @@ class NearNestLocalTransferModule(
                 sequence.toLong() * payloadCapacity.toLong(),
               )
             val repairLength = relativeEnd - relativeStart
+            repairRequests += 1
+            if (repairRequests == 1 || repairRequests % 25 == 0) {
+              emitDiagnostic("TCP repair job=$jobId request=$repairRequests offset=$relativeStart bytes=$repairLength repairedBytes=$repairedBytes")
+            }
             val repairUri =
               requestedUri
                 .buildUpon()
@@ -857,6 +1034,7 @@ class NearNestLocalTransferModule(
   @ReactMethod
   fun cancelAll(promise: Promise) {
     cancellationGeneration.incrementAndGet()
+    releaseTransferWifiLock()
     promise.resolve(null)
   }
 
@@ -868,6 +1046,7 @@ class NearNestLocalTransferModule(
   override fun invalidate() {
     cancellationGeneration.incrementAndGet()
     disconnectInternal()
+    audioHandler.post { audioPlayer?.release(); audioPlayer = null; audioReady = false }
     executor.shutdownNow()
     super.invalidate()
   }
@@ -885,6 +1064,7 @@ class NearNestLocalTransferModule(
     }
 
   private fun disconnectInternal() {
+    releaseTransferWifiLock()
     connectivityManager.bindProcessToNetwork(null)
     val callback = networkCallback
     networkCallback = null
@@ -895,6 +1075,101 @@ class NearNestLocalTransferModule(
         // It may already have been released by Android.
       }
     }
+    val legacyNetworkId = legacyWifiNetworkId
+    this.legacyWifiNetworkId = null
+    if (legacyNetworkId != null) {
+      @Suppress("DEPRECATION")
+      val wifiManager = context.applicationContext.getSystemService(WifiManager::class.java)
+      @Suppress("DEPRECATION")
+      wifiManager?.removeNetwork(legacyNetworkId)
+      @Suppress("DEPRECATION")
+      wifiManager?.disconnect()
+    }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun connectLegacyHotspot(
+    ssid: String,
+    password: String,
+    promise: Promise,
+  ) {
+    val wifiManager =
+      context.applicationContext.getSystemService(WifiManager::class.java)
+    if (wifiManager == null) {
+      releaseTransferWifiLock()
+      promise.reject("wifi.unavailable", "Android Wi-Fi service is unavailable")
+      return
+    }
+    val generation = cancellationGeneration.get()
+    executor.execute {
+      val startedAt = android.os.SystemClock.elapsedRealtime()
+      try {
+        ensureNotCancelled(generation)
+        if (!wifiManager.isWifiEnabled) {
+          throw IllegalStateException("Turn on phone Wi-Fi before syncing recordings")
+        }
+        val configuration = WifiConfiguration().apply {
+          SSID = "\"$ssid\""
+          preSharedKey = "\"$password\""
+          allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
+        }
+        val networkId = wifiManager.addNetwork(configuration)
+        if (networkId < 0) {
+          throw IllegalStateException("Android could not add the NearNest hotspot")
+        }
+        legacyWifiNetworkId = networkId
+        fun selectHotspot(attempt: Int) {
+          ensureNotCancelled(generation)
+          emitDiagnostic("Hotspot join attempt=$attempt networkId=$networkId")
+          // A disconnect/reconnect pair can race the vendor's auto-join logic.
+          // Selecting the network initiates association; reconnect is unnecessary.
+          if (!wifiManager.enableNetwork(networkId, true)) {
+            throw IllegalStateException("Android could not select the NearNest hotspot")
+          }
+        }
+        selectHotspot(1)
+        var attempts = 1
+        var nextRetryAt = startedAt + 5_000
+        var previousState = ""
+        repeat(120) {
+          ensureNotCancelled(generation)
+          val info = wifiManager.connectionInfo
+          val onTarget = info.networkId == networkId
+          val state = "target=$onTarget state=${info.supplicantState} ipReady=${info.ipAddress != 0}"
+          if (state != previousState) {
+            emitDiagnostic("Hotspot join $state elapsedMs=${android.os.SystemClock.elapsedRealtime() - startedAt}")
+            previousState = state
+          }
+          // Android may redact SSID; networkId is the configuration we created.
+          if (onTarget && info.ipAddress != 0 &&
+              info.supplicantState == android.net.wifi.SupplicantState.COMPLETED) {
+            val network = connectivityManager.allNetworks.firstOrNull { candidate ->
+              connectivityManager.getNetworkCapabilities(candidate)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            }
+            if (network != null && connectivityManager.bindProcessToNetwork(network)) {
+              emitDiagnostic("Hotspot connected elapsedMs=${android.os.SystemClock.elapsedRealtime() - startedAt}")
+              promise.resolve(null)
+              return@execute
+            }
+          }
+          val now = android.os.SystemClock.elapsedRealtime()
+          if (!onTarget && attempts < 3 && now >= nextRetryAt) {
+            selectHotspot(++attempts)
+            nextRetryAt = now + 5_000
+          }
+          Thread.sleep(250)
+        }
+        throw IllegalStateException(
+          "Timed out joining the NearNest hotspot before any audio was copied. " +
+            "Keep the wearable nearby and disable automatic switching to another Wi-Fi network. " +
+            "Last connection: $previousState",
+        )
+      } catch (error: Exception) {
+        disconnectInternal()
+        promise.reject("wifi.unavailable", error.message, error)
+      }
+    }
   }
 
   private fun ensureNotCancelled(generation: Long) {
@@ -902,6 +1177,14 @@ class NearNestLocalTransferModule(
         Thread.currentThread().isInterrupted) {
       throw IllegalStateException("Transfer was cancelled")
     }
+  }
+
+  private fun emitDiagnostic(message: String) {
+    Log.i("NearNestLocalTransfer", message)
+    val event = Arguments.createMap()
+    event.putString("message", message)
+    context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit("NearNestTransferDiagnostic", event)
   }
 
   private fun emitProgress(

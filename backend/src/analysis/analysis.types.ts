@@ -20,6 +20,8 @@ export interface IngestAudioJob {
 }
 
 export interface AnalysisResponse {
+  audioDeletedAt?: Date;
+  failureReason?: string;
   acousticStage: PipelineStageProgress;
   acousticSummary?: AcousticSummary;
   riskStage: PipelineStageProgress;
