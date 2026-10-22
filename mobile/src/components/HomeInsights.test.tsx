@@ -37,3 +37,17 @@ test('opens an explained risk card with timestamped playback and real summary me
   expect(clips.length).toBeGreaterThan(0);
   expect(clips[0].props.clip.endMs).toBe(18000);
 });
+
+test('history includes older uploads and can regenerate their insights', async () => {
+  const older = { analysisId: 'old', childId: 'child', fileName: 'yesterday.mp3', createdAt: '2026-01-01T12:00:00Z', status: 'COMPLETED', progress: 100, conversationStage: { status: 'COMPLETED' }, riskStage: { status: 'COMPLETED' }, riskSummary: { incidentCount: 1, highSeverityCount: 0 } };
+  const newer = { ...older, analysisId: 'new', fileName: 'today.mp3', createdAt: '2026-01-02T12:00:00Z' };
+  (loadAnalyses as jest.Mock).mockResolvedValue([older, newer]);
+  (authenticatedRequest as jest.Mock).mockImplementation(async (path: string) => path === '/children' ? { data: [] } : { ...older, status: 'PROCESSING', contextStage: { status: 'QUEUED' }, riskStage: { status: 'PENDING' }, riskSummary: undefined });
+  await act(async () => { tree = Renderer.create(<HomeInsights refreshKey={1} paused={false} history />); });
+  expect(tree.root.findAll(n => n.props.children === 'yesterday.mp3').length).toBeGreaterThan(0);
+  expect(tree.root.findAll(n => n.props.children === 'today.mp3').length).toBeGreaterThan(0);
+  const button = tree.root.findAll(n => n.props.accessibilityLabel === 'Regenerate insights for yesterday.mp3' && typeof n.props.onPress === 'function')[0];
+  await act(async () => { button.props.onPress(); });
+  expect(authenticatedRequest).toHaveBeenCalledWith('/audio-analysis/old/classify-context', expect.objectContaining({ method: 'POST', body: JSON.stringify({ force: true }) }));
+  expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Regenerate insights for yesterday.mp3' && typeof n.props.onPress === 'function')[0].props.disabled).toBe(true);
+});

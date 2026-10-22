@@ -60,3 +60,28 @@ The acoustic endpoint applies the local AudioSet-trained Zipformer tagger to
 health sounds, impacts, and hazards are mapped through the supplied edit map
 to the original recording timeline. These are screening candidates rather
 than verified incidents.
+
+## Child-safety transcript rules (context model 1.4.0)
+
+`src/audio_workers/safety_rules.py` extends English, Hindi and Hinglish review
+cues: insults/bullying, direct threats, physical-harm disclosures, unwanted
+contact, secrecy, inappropriate personal requests, coercion/blackmail, unsafe
+contact/password requests, substance pressure, possible unmet care needs,
+physical distress, self-harm-related language and immediate danger.
+
+These phrase rules are not comprehensive language understanding or a guarantee
+of child safety. Missing or incorrect ASR words can still be missed. Timestamps
+cover the source utterance, not individual words. Child involvement remains
+unconfirmed. Rule confidence scores are not calibrated probabilities.
+
+Insults produce medium-priority review cues. Bare English `sale` is excluded;
+directed phrases such as `abe sale` are covered. Profanity retains per-session
+thresholds: one severe, two moderate, or three total occurrences. Educational
+frames downgrade safety cues to low priority; reported disclosures remain
+reviewable. Negation handling is narrow; grammar and sarcasm can cause errors.
+
+Rebuild/restart the worker to load the new rules. Previously completed recordings
+require context and downstream risk re-analysis; no historical jobs are
+re-run automatically. Review the corresponding audio to interpret findings.
+
+Validation: `pytest tests/test_context.py tests/test_child_safety_rules.py`.

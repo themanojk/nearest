@@ -69,6 +69,7 @@ describe('AnalysisService', () => {
   function setup(document = analysisDocument()) {
     const model = {
       create: jest.fn().mockResolvedValue(document),
+      updateOne: jest.fn().mockReturnValue({ exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }) }),
       deleteOne: jest.fn().mockReturnValue({
         exec: jest.fn().mockResolvedValue(undefined),
       }),
@@ -90,7 +91,7 @@ describe('AnalysisService', () => {
     const conversationModel = {} as Model<ConversationSession>;
     const eventModel = {} as Model<TimelineEvent>;
     const acousticEventModel = {} as Model<AcousticEvent>;
-    const riskIncidentModel = {} as Model<RiskIncident>;
+    const riskIncidentModel = { deleteMany: jest.fn().mockReturnValue({ exec: jest.fn().mockResolvedValue({}) }) } as unknown as Model<RiskIncident>;
     const diarizationQueue = {
       add: jest.fn().mockResolvedValue(undefined),
     } as unknown as Queue<DiarizeAudioJob>;
@@ -136,6 +137,7 @@ describe('AnalysisService', () => {
 
     return {
       model,
+      contextQueue,
       queue,
       service: new AnalysisService(
         model,
@@ -196,6 +198,43 @@ describe('AnalysisService', () => {
     (model.findOne as jest.Mock).mockReturnValue({ exec: jest.fn().mockResolvedValue(null) });
     await expect(service.deleteAudio('tenant-b', '66a111111111111111111111')).rejects.toThrow();
     expect(storage.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it('queues forced regeneration and allows retry after queue failure', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.conversationStage = { status: PipelineStageStatus.Completed, progress: 100, attempts: 1 };
+    document.contextStage = { status: PipelineStageStatus.Completed, progress: 100, attempts: 1 };
+    const { service, contextQueue, model } = setup(document);
+    await service.startContextClassification('tenant-a', document._id.toString(), { force: true });
+    expect(contextQueue.add).toHaveBeenCalledWith('classify', { analysisId: document._id.toString(), tenantId: 'tenant-a' }, expect.objectContaining({ attempts: 3 }));
+    (contextQueue.add as jest.Mock).mockRejectedValueOnce(new Error('Queue offline'));
+    await expect(service.startContextClassification('tenant-a', document._id.toString(), { force: true })).rejects.toThrow('Queue offline');
+    expect(model.updateOne).toHaveBeenLastCalledWith(expect.objectContaining({ tenantId: 'tenant-a' }), expect.objectContaining({ $set: expect.objectContaining({ 'contextStage.status': PipelineStageStatus.Failed }) }));
+  });
+
+  it('does not enqueue when another request already claimed regeneration', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.conversationStage = { status: PipelineStageStatus.Completed, progress: 100, attempts: 1 };
+    const { service, contextQueue, model } = setup(document);
+    (model.updateOne as jest.Mock).mockReturnValue({ exec: jest.fn().mockResolvedValue({ modifiedCount: 0 }) });
+    await service.startContextClassification('tenant-a', document._id.toString(), { force: true });
+    expect(contextQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('rejects regeneration when the original recording was deleted', async () => {
+    const document = analysisDocument(AnalysisStatus.Completed);
+    document.audioDeletedAt = new Date();
+    const { service } = setup(document);
+    await expect(service.startContextClassification('tenant-a', document._id.toString(), { force: true })).rejects.toThrow('Original audio was deleted');
+  });
+
+  it('does not restart context while downstream risk analysis is running', async () => {
+    const document = analysisDocument(AnalysisStatus.Processing);
+    document.conversationStage = { status: PipelineStageStatus.Completed, progress: 100, attempts: 1 };
+    document.riskStage = { status: PipelineStageStatus.Running, progress: 10, attempts: 1 };
+    const { service } = setup(document);
+    const result = await service.startContextClassification('tenant-a', document._id.toString(), { force: true });
+    expect(result.status).toBe(AnalysisStatus.Processing);
   });
 
   it('creates an awaiting-upload analysis and returns a signed URL', async () => {

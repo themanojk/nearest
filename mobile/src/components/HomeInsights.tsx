@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AppState, Pressable, View } from 'react-native';
 import { authenticatedRequest } from '../services/auth';
 import {
+  regenerateInsights,
   indicator,
   incidentClip,
   incidentLabel,
@@ -69,7 +70,25 @@ function Badge({ items }: { items: AnalysisInsight[] }) {
     />
   );
 }
-function RecordingInsight({ item }: { item: AnalysisInsight }) {
+function RecordingInsight({ item, onUpdated }: { item: AnalysisInsight; onUpdated: (item: AnalysisInsight) => void }) {
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState('');
+  const retryLock = useRef(false);
+  const running = ['QUEUED', 'PROCESSING'].includes(item.status) ||
+    [item.contextStage, item.acousticStage, item.riskStage].some(stage => stage && ['QUEUEING', 'QUEUED', 'RUNNING'].includes(stage.status));
+  const canRetry = !item.audioDeletedAt && !running && item.conversationStage?.status === 'COMPLETED';
+  async function regenerate() {
+    if (!canRetry || retryLock.current) return;
+    retryLock.current = true;
+    setRetrying(true); setRetryError('');
+    try {
+      const updated = await regenerateInsights(item.analysisId);
+      requestVersion.current++;
+      setExpanded(false); setEvents([]); setTotal(0); setPage(0); setBusy(false);
+      onUpdated(updated);
+    } catch (err) { setRetryError(errorText(err)); }
+    finally { retryLock.current = false; setRetrying(false); }
+  }
   const [expanded, setExpanded] = useState(false);
   const requestVersion = useRef(0);
   const requestedPage = useRef(1);
@@ -103,6 +122,7 @@ function RecordingInsight({ item }: { item: AnalysisInsight }) {
       </Txt>
       <Txt size={11} color={colors.muted}>
         Uploaded{' '}
+        {new Date(item.createdAt).toLocaleDateString()}{' · '}
         {new Date(item.createdAt).toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
@@ -141,6 +161,14 @@ function RecordingInsight({ item }: { item: AnalysisInsight }) {
           {item.failureReason}
         </Txt>
       )}
+      <Pressable accessibilityRole="button" accessibilityLabel={`Regenerate insights for ${item.fileName}`}
+        accessibilityState={{ disabled: !canRetry || retrying, busy: retrying }} disabled={!canRetry || retrying}
+        onPress={() => void regenerate()} style={{ flexDirection: 'row', gap: 8, paddingVertical: 12, alignItems: 'center', opacity: canRetry ? 1 : 0.6 }}>
+        <Icon name="refresh" size={18} />
+        <Txt size={13} weight="semibold">{retrying ? 'Requesting analysis…' : running ? 'Analysis in progress' : 'Regenerate insights'}</Txt>
+      </Pressable>
+      <Txt size={11} color={colors.body}>{item.audioDeletedAt ? 'Regeneration unavailable: original audio was deleted.' : running ? 'Results refresh automatically when ready.' : canRetry ? 'Rechecks the saved transcript and audio with the current rules. No upload needed.' : 'Conversation processing must finish before regeneration is available.'}</Txt>
+      {!!retryError && <Txt size={12} color={colors.destructive}>{retryError} · Please try again.</Txt>}
       {item.riskStage?.status === 'COMPLETED' && (
         <Pressable
           accessibilityRole="button"
@@ -196,14 +224,17 @@ export default function HomeInsights({
   refreshKey,
   paused,
   onCount,
+  history = false,
 }: {
   refreshKey: number;
   paused: boolean;
   onCount?: (count: number) => void;
+  history?: boolean;
 }) {
   const [items, setItems] = useState<AnalysisInsight[]>([]);
   const [names, setNames] = useState<Record<string, string>>({});
   const [child, setChild] = useState('');
+  const [selectedDay, setSelectedDay] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [updated, setUpdated] = useState<Date | null>(null);
@@ -281,7 +312,9 @@ export default function HomeInsights({
     .filter(item => item.childId === selected)
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const day = childItems[0] ? uploadDay(childItems[0].createdAt) : null;
-  const recent = childItems.filter(item => uploadDay(item.createdAt) === day);
+  const days = [...new Set(childItems.map(item => uploadDay(item.createdAt)))];
+  const effectiveDay = days.includes(selectedDay) ? selectedDay : '';
+  const recent = history ? childItems.filter(item => !effectiveDay || uploadDay(item.createdAt) === effectiveDay) : childItems.filter(item => uploadDay(item.createdAt) === day);
   const complete = recent.filter(
     item => item.riskStage?.status === 'COMPLETED' && item.riskSummary,
   ).length;
@@ -318,7 +351,7 @@ export default function HomeInsights({
         }}
       >
         <Txt weight="serif" size={21}>
-          Daily insights
+          {history ? 'Recording history' : 'Daily insights'}
         </Txt>
         <Pressable
           disabled={loading || paused}
@@ -332,7 +365,7 @@ export default function HomeInsights({
       {children.length > 1 && (
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>
           {children.map(id => (
-            <Pressable key={id} onPress={() => setChild(id)}>
+            <Pressable key={id} onPress={() => { setChild(id); setSelectedDay(''); }}>
               <Txt weight={id === selected ? 'bold' : 'regular'} size={12}>
                 {names[id] || `Child ${id.slice(-6)}`}
               </Txt>
@@ -340,6 +373,11 @@ export default function HomeInsights({
           ))}
         </View>
       )}
+      {history && days.length > 0 && <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+        {['', ...days].map(date => <Pressable key={date || 'all'} accessibilityRole="button" accessibilityState={{ selected: date === effectiveDay }} onPress={() => setSelectedDay(date)} style={{ padding: 10, borderRadius: 8, backgroundColor: date === effectiveDay ? colors.tintChipStrong : colors.glassSoft }}>
+          <Txt size={12}>{date || 'All dates'}</Txt>
+        </Pressable>)}
+      </View>}
       {!!error && (
         <Txt size={12} color={colors.destructive}>
           Could not refresh insights: {error}.{' '}
@@ -357,7 +395,7 @@ export default function HomeInsights({
       >
         <Txt size={14} weight="semibold">
           {recent.length
-            ? `${names[selected] || 'Latest day'} · ${new Date(
+            ? history ? `${names[selected] || 'Recordings'} · ${effectiveDay || 'All upload dates'}` : `${names[selected] || 'Latest day'} · ${new Date(
                 recent[0].createdAt,
               ).toLocaleDateString()}`
             : 'No recordings yet'}
@@ -424,7 +462,7 @@ export default function HomeInsights({
             Recordings & insights
           </Txt>
           {recent.map(item => (
-            <RecordingInsight key={item.analysisId} item={item} />
+            <RecordingInsight key={item.analysisId} item={item} onUpdated={updatedItem => setItems(current => current.map(recording => recording.analysisId === updatedItem.analysisId ? updatedItem : recording))} />
           ))}
         </>
       )}

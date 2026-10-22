@@ -8,6 +8,7 @@ export type AnalysisInsight = {
   status: string;
   progress: number;
   failureReason?: string;
+  conversationStage?: { status: string };
   riskStage?: { status: string };
   riskSummary?: { incidentCount: number; highSeverityCount: number };
   contextStage?: { status: string };
@@ -122,6 +123,13 @@ export function insightLines(item: AnalysisInsight): string[] {
 
 export function incidentLabel(value: string): string {
   const labels: Record<string, string> = {
+    insult: 'Insulting language', coercion: 'Pressure or blackmail',
+    unsafe_contact: 'Potentially unsafe contact request', substance_pressure: 'Pressure to try substances',
+    medical_distress: 'Possible urgent physical distress', neglect_disclosure: 'Possible unmet care needs',
+    secrecy_request: 'Request to keep a secret', violence_disclosure: 'Reported physical harm',
+    inappropriate_request: 'Inappropriate personal request', threat: 'Threatening language',
+    imminent_danger: 'Possible immediate danger', self_harm: 'Self-harm-related language',
+    profanity_exposure: 'Repeated or strong profanity',
     verbal_aggression: 'Aggressive language', bullying: 'Possible bullying',
     profanity: 'Strong language', distress: 'Signs of distress',
     physical_threat: 'Possible physical threat', health_concern: 'Health-related sounds',
@@ -133,4 +141,11 @@ export function incidentClip(event: Incident, durationMs?: number) {
   if (!Number.isFinite(event.startMs) || !Number.isFinite(event.endMs) || event.startMs < 0 || event.endMs <= event.startMs) return undefined;
   if (durationMs !== undefined && durationMs > 0 && event.startMs >= durationMs) return undefined;
   return { startMs: event.startMs, endMs: Math.min(event.endMs, durationMs && durationMs > 0 ? durationMs : event.endMs) };
+}
+
+export function regenerateInsights(id: string): Promise<AnalysisInsight> {
+  return authenticatedRequest<AnalysisInsight>(
+    `/audio-analysis/${encodeURIComponent(id)}/classify-context`,
+    { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force: true }) },
+  );
 }

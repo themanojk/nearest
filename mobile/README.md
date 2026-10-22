@@ -161,3 +161,17 @@ Android uses prepared/seek-complete callbacks and a 40 ms end check; iOS uses
 an exact seek and forwardPlaybackEndTime. Player timing can vary slightly by
 codec. Verify on device with MP3 and existing FLAC playback copies, slow
 network loading, switching cards, app backgrounding, and deleted recordings.
+
+## History and manual insight regeneration
+
+History now loads saved backend recordings and their insights (not local sample
+reports), newest first, with child and upload-date filters. All dates is the
+default. Playback, flagged moments and regeneration use the same recording cards
+as Today. Results refresh while the app is active; syncing pauses refresh.
+
+Regenerate insights calls the existing force-context endpoint. It reuses the
+saved transcript, reruns context rules, then sound analysis and risk aggregation;
+it does not retranscribe or upload audio. It is available after conversation
+processing completes, while no downstream analysis is running and original
+audio remains. Queue failures are retryable. Deploy backend changes and reload
+the app; existing saved recordings do not need to be imported again.

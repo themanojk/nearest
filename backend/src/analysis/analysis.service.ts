@@ -539,16 +539,18 @@ export class AnalysisService {
     input: StartContextClassificationDto,
   ): Promise<AnalysisResponse> {
     const document = await this.findDocument(tenantId, analysisId);
+    if (document.audioDeletedAt) throw new ConflictException('Original audio was deleted; insights cannot be regenerated');
     if (
-      document.conversationStage.status !== PipelineStageStatus.Completed
+      document.conversationStage?.status !== PipelineStageStatus.Completed
     ) {
       throw new BadRequestException(
         'Conversation building must complete before context classification',
       );
     }
     if (
-      document.contextStage?.status === PipelineStageStatus.Running ||
-      document.contextStage?.status === PipelineStageStatus.Queued
+      [document.contextStage, document.acousticStage, document.riskStage].some(
+        stage => stage && [PipelineStageStatus.Queueing, PipelineStageStatus.Running, PipelineStageStatus.Queued].includes(stage.status)
+      )
     ) {
       return this.toResponse(document);
     }
@@ -558,9 +560,10 @@ export class AnalysisService {
     ) {
       return this.toResponse(document);
     }
-    await this.analysisModel
+    const claimed = await this.analysisModel
       .updateOne(
-        { _id: document._id, tenantId },
+        { _id: document._id, tenantId, updatedAt: document.updatedAt,
+          'contextStage.status': document.contextStage?.status, audioDeletedAt: null },
         {
           $set: {
             status: AnalysisStatus.Processing,
@@ -578,29 +581,41 @@ export class AnalysisService {
             },
           },
           $unset: {
+            failureReason: 1,
+            completedAt: 1,
             riskSummary: 1,
             ...(input.force ? { contextSummary: 1 } : {}),
           },
         },
       )
       .exec();
-    await this.riskIncidentModel
-      .deleteMany({ analysisJobId: document._id, tenantId })
-      .exec();
+    if (!claimed.modifiedCount) return this.toResponse(await this.findDocument(tenantId, analysisId));
     const queueJobId = input.force
       ? `context-${analysisId}-${Date.now()}`
       : `context-${analysisId}`;
-    await this.contextQueue.add(
-      CONTEXT_CLASSIFICATION_JOB,
-      { analysisId, tenantId },
-      {
-        jobId: queueJobId,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 5_000 },
-        removeOnComplete: 1000,
-        removeOnFail: 5000,
-      },
-    );
+    try {
+      await this.riskIncidentModel
+        .deleteMany({ analysisJobId: document._id, tenantId })
+        .exec();
+      await this.contextQueue.add(
+        CONTEXT_CLASSIFICATION_JOB,
+        { analysisId, tenantId },
+        {
+          jobId: queueJobId,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5_000 },
+          removeOnComplete: 1000,
+          removeOnFail: 5000,
+        },
+      );
+    } catch (error) {
+      await this.analysisModel.updateOne(
+        { _id: document._id, tenantId, 'contextStage.status': PipelineStageStatus.Queued },
+        { $set: { status: AnalysisStatus.Failed, 'contextStage.status': PipelineStageStatus.Failed,
+          failureReason: 'Could not queue insight regeneration. Please retry.' } },
+      ).exec();
+      throw error;
+    }
     this.logger.log(
       `context.dispatched analysisId=${analysisId} force=${input.force} queueJobId=${queueJobId}`,
     );

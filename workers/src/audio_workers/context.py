@@ -15,8 +15,9 @@ from audio_workers.contracts import (
     QualityAssessment,
     SafetySignal,
 )
+from audio_workers.safety_rules import CHILD_SAFETY_RULES, EDUCATIONAL_FRAME
 
-MODEL_NAME = "rules-context-en-hi/1.3.0"
+MODEL_NAME = "rules-context-en-hi/1.4.0"
 CONTEXT_WINDOW_MS = 15_000
 
 _NAVIGATION_PATTERN = re.compile(
@@ -157,6 +158,12 @@ _SIGNAL_RULES = [
     ),
 ]
 
+_SIGNAL_RULES.extend(
+    _SignalRule(label, severity, 0.78, re.compile(pattern, re.IGNORECASE))
+    for label, severity, pattern in CHILD_SAFETY_RULES
+)
+_EDUCATIONAL_FRAME = re.compile(EDUCATIONAL_FRAME, re.IGNORECASE)
+
 _AMBIGUOUS_DANGER_PATTERN = re.compile(
     r"\b(?:(?:i think|think) )?i(?:'m| am) "
     r"(?:going to|gonna) die\b",
@@ -214,6 +221,43 @@ _PROFANITY_ALIASES = [
         ),
     ),
 ]
+
+_PROFANITY_ALIASES.extend(
+    [
+        _ProfanityRule(
+            "saala",
+            "moderate",
+            0.85,
+            re.compile(
+                r"(?<!\w)(?:saale|sala|saali|साला|साले|साली)(?!\w)", re.IGNORECASE
+            ),
+        ),
+        _ProfanityRule(
+            "kameena",
+            "moderate",
+            0.85,
+            re.compile(
+                r"(?<!\w)(?:kameene|kamina|kamine|kameeni|कमीना|कमीने|कमीनी)(?!\w)",
+                re.IGNORECASE,
+            ),
+        ),
+        _ProfanityRule(
+            "madarchod",
+            "severe",
+            0.85,
+            re.compile(r"(?<!\w)(?:madar\s+chod|मादरचोद)(?!\w)", re.IGNORECASE),
+        ),
+        _ProfanityRule(
+            "behenchod",
+            "severe",
+            0.85,
+            re.compile(
+                r"(?<!\w)(?:behan\s*chod|bhenchod|बहनचोद|बहन\s+चोद)(?!\w)",
+                re.IGNORECASE,
+            ),
+        ),
+    ]
+)
 
 _INSTRUCTION_PATTERN = re.compile(
     r"\b(?:please|listen|sit down|stand up|you need to|you have to"
@@ -312,8 +356,7 @@ def _repeated_token_ratio(tokens: list[str]) -> float:
     if len(tokens) < 2:
         return 0.0
     repeated = sum(
-        left == right
-        for left, right in zip(tokens, tokens[1:], strict=False)
+        left == right for left, right in zip(tokens, tokens[1:], strict=False)
     )
     return repeated / (len(tokens) - 1)
 
@@ -328,6 +371,13 @@ def _detect_signals(
             match = rule.pattern.search(utterance.text)
             if not match:
                 continue
+            prefix = utterance.text[max(0, match.start() - 35) : match.start()]
+            if rule.signal_type in {"threat", "self_harm"} and re.search(
+                r"\b(?:won't|will not|would never|never|don't|do not|not going to)\s*$",
+                prefix,
+                re.IGNORECASE,
+            ):
+                continue
             key = (
                 rule.signal_type,
                 utterance.start_ms,
@@ -339,8 +389,15 @@ def _detect_signals(
             signals.append(
                 SafetySignal(
                     signal_type=rule.signal_type,
-                    severity=rule.severity,
-                    confidence=rule.confidence,
+                    severity="low"
+                    if _EDUCATIONAL_FRAME.search(utterance.text)
+                    else rule.severity,
+                    confidence=min(
+                        rule.confidence,
+                        utterance.confidence
+                        if utterance.confidence is not None
+                        else 1.0,
+                    ),
                     start_ms=utterance.start_ms,
                     end_ms=utterance.end_ms,
                     speaker_id=utterance.speaker_id,
@@ -367,10 +424,9 @@ def _detect_contextual_danger(
                 and candidate.end_ms >= utterance.start_ms - CONTEXT_WINDOW_MS
             )
         )
-        if (
-            _FIGURATIVE_CONTEXT_PATTERN.search(context)
-            or not _DANGER_CONTEXT_PATTERN.search(context)
-        ):
+        if _FIGURATIVE_CONTEXT_PATTERN.search(
+            context
+        ) or not _DANGER_CONTEXT_PATTERN.search(context):
             continue
         signals.append(
             SafetySignal(
@@ -422,7 +478,9 @@ def _detect_profanity(
                 if key in seen:
                     continue
                 seen.add(key)
-                utterance_confidence = utterance.confidence or 1.0
+                utterance_confidence = (
+                    utterance.confidence if utterance.confidence is not None else 1.0
+                )
                 occurrences.append(
                     ProfanityOccurrence(
                         canonical_term=rule.canonical_term,
@@ -452,29 +510,19 @@ def _detect_profanity(
         for severity in _PROFANITY
     }
     severity = next(
-        (
-            item
-            for item in ("severe", "moderate", "mild")
-            if matched[item]
-        ),
+        (item for item in ("severe", "moderate", "mild") if matched[item]),
         "none",
     )
     terms = sorted(
-        term
-        for severity_terms in matched.values()
-        for term in severity_terms
+        term for severity_terms in matched.values() for term in severity_terms
     )
-    severe_count = sum(
-        occurrence.severity == "severe" for occurrence in occurrences
-    )
+    severe_count = sum(occurrence.severity == "severe" for occurrence in occurrences)
     moderate_count = sum(
         occurrence.severity == "moderate" for occurrence in occurrences
     )
     occurrence_count = len(occurrences)
     notification_recommended = bool(
-        severe_count >= 1
-        or moderate_count >= 2
-        or occurrence_count >= 3
+        severe_count >= 1 or moderate_count >= 2 or occurrence_count >= 3
     )
     if occurrence_count >= 5:
         exposure_level = "high_density"
@@ -491,9 +539,7 @@ def _detect_profanity(
             f"{'s' if severe_count != 1 else ''} detected"
         )
     elif notification_recommended:
-        notification_reason = (
-            f"{occurrence_count} curse-word occurrences detected"
-        )
+        notification_reason = f"{occurrence_count} curse-word occurrences detected"
     return ProfanityAssessment(
         severity=severity,
         terms=terms,
@@ -523,15 +569,13 @@ def _profanity_signals(
             signal_type="profanity_exposure",
             severity="medium",
             confidence=max(
-                occurrence.confidence
-                for occurrence in profanity.occurrences
+                occurrence.confidence for occurrence in profanity.occurrences
             ),
             start_ms=first.start_ms,
             end_ms=last.end_ms,
             speaker_id=first.speaker_id,
             evidence=(
-                profanity.notification_reason
-                or "Repeated curse-word exposure detected"
+                profanity.notification_reason or "Repeated curse-word exposure detected"
             ),
         )
     ]
@@ -557,6 +601,23 @@ def _conversation_type(
             label="imminent_danger",
             confidence=confidence,
         )
+    for label in (
+        "medical_distress",
+        "coercion",
+        "unsafe_contact",
+        "substance_pressure",
+        "neglect_disclosure",
+        "bullying",
+    ):
+        if label in signal_types:
+            return ClassificationLabel(
+                label=label,
+                confidence=max(
+                    signal.confidence
+                    for signal in signals
+                    if signal.signal_type == label
+                ),
+            )
     if signal_types & {
         "threat",
         "violence_disclosure",

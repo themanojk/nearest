@@ -166,7 +166,7 @@ function riskFamily(candidate: RiskCandidate): string {
   const category = candidate.category?.toLocaleLowerCase();
   if (
     candidate.source === 'transcript' &&
-    ['profanity', 'profanity_exposure', 'insult'].includes(label)
+    ['profanity', 'profanity_exposure', 'insult', 'bullying'].includes(label)
   ) {
     return 'conduct';
   }
