@@ -13,7 +13,7 @@ import type {
 } from './types';
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/v1';
+  import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:9000/v1';
 const AUTH_STORAGE_KEY = 'kid-audio-auth-session';
 let sessionInFlight: Promise<AuthTokens> | null = null;
 

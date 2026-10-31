@@ -1465,7 +1465,8 @@ export function App() {
                     type="button"
                     onClick={() =>
                       void beginDiarization(
-                        analysis.diarizationStage.status === 'COMPLETED',
+                        analysis.diarizationStage.status === 'COMPLETED' ||
+                          analysis.diarizationStage.status === 'FAILED',
                       )
                     }
                   >
