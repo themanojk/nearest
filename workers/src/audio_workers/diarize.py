@@ -1,4 +1,3 @@
-import subprocess
 import tempfile
 import time
 import wave
@@ -11,6 +10,7 @@ import kaldi_native_fbank as knf  # type: ignore[import-untyped]
 import numpy as np
 import onnxruntime as ort  # type: ignore[import-untyped]
 
+from audio_workers.audio_cache import AudioCacheError, ensure_normalized_audio
 from audio_workers.config import settings
 from audio_workers.contracts import (
     DiarizationRequest,
@@ -44,6 +44,7 @@ def diarize_audio(
     *,
     ffmpeg_path: str,
     timeout_seconds: int,
+    normalized_source: Path | None = None,
 ) -> DiarizationResponse:
     started_at = time.monotonic()
     utterances = _group_words(request.words)
@@ -56,22 +57,31 @@ def diarize_audio(
             turns=[],
         )
 
-    with tempfile.TemporaryDirectory(prefix="kid-audio-diarize-") as directory:
-        clip_path = Path(directory) / "speech.wav"
-        _extract_utterances(
+    try:
+        source_path = normalized_source or ensure_normalized_audio(
+            request.analysis_id,
             request.source_url,
-            utterances,
-            clip_path,
             ffmpeg_path=ffmpeg_path,
             timeout_seconds=timeout_seconds,
+        )
+    except AudioCacheError as error:
+        raise DiarizationError(str(error)) from error
+
+    with tempfile.TemporaryDirectory(prefix="kid-audio-diarize-") as directory:
+        clip_path = Path(directory) / "speech.wav"
+        _assemble_utterances(
+            source_path,
+            utterances,
+            clip_path,
         )
         samples, sample_rate = _read_wave(clip_path)
 
     embeddings = [
         _speaker_embedding(
             samples[
-                round(item.clip_start_ms * sample_rate / 1_000) :
-                round(item.clip_end_ms * sample_rate / 1_000)
+                round(item.clip_start_ms * sample_rate / 1_000) : round(
+                    item.clip_end_ms * sample_rate / 1_000
+                )
             ],
             sample_rate,
         )
@@ -97,10 +107,8 @@ def _group_words(words: list[DiarizationWord]) -> list[_Utterance]:
         current = utterances[-1] if utterances else None
         should_split = (
             current is None
-            or word.start_ms - current.end_ms
-            > settings.diarization_utterance_gap_ms
-            or word.end_ms - current.start_ms
-            > settings.diarization_max_utterance_ms
+            or word.start_ms - current.end_ms > settings.diarization_utterance_gap_ms
+            or word.end_ms - current.start_ms > settings.diarization_max_utterance_ms
         )
         if should_split:
             utterances.append(
@@ -117,65 +125,55 @@ def _group_words(words: list[DiarizationWord]) -> list[_Utterance]:
     return utterances
 
 
-def _extract_utterances(
-    source_url: str,
+def _assemble_utterances(
+    source_path: Path,
     utterances: list[_Utterance],
     output_path: Path,
-    *,
-    ffmpeg_path: str,
-    timeout_seconds: int,
 ) -> None:
-    command = [ffmpeg_path, "-nostdin", "-v", "error"]
-    clip_cursor_ms = 0
-    for utterance in utterances:
-        extraction_start = max(0, utterance.start_ms - 150)
-        extraction_end = utterance.end_ms + 150
-        duration_ms = extraction_end - extraction_start
-        utterance.clip_start_ms = clip_cursor_ms
-        utterance.clip_end_ms = clip_cursor_ms + duration_ms
-        clip_cursor_ms += duration_ms
-        command.extend(
-            [
-                "-ss",
-                f"{extraction_start / 1_000:.3f}",
-                "-t",
-                f"{duration_ms / 1_000:.3f}",
-                "-i",
-                source_url,
-            ]
-        )
-    inputs = "".join(f"[{index}:a:0]" for index in range(len(utterances)))
-    if len(utterances) == 1:
-        command.extend(["-map", "0:a:0"])
-    else:
-        command.extend(
-            [
-                "-filter_complex",
-                f"{inputs}concat=n={len(utterances)}:v=0:a=1[out]",
-                "-map",
-                "[out]",
-            ]
-        )
-    command.extend(
-        [
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-y",
-            str(output_path),
-        ]
-    )
-    process = subprocess.run(
-        command,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
-    if process.returncode != 0 or not output_path.exists():
-        raise DiarizationError("FFmpeg could not extract diarization utterances")
+    try:
+        with wave.open(str(source_path), "rb") as source:
+            sample_rate = source.getframerate()
+            if (
+                source.getnchannels() != 1
+                or source.getsampwidth() != 2
+                or sample_rate != 16_000
+            ):
+                raise DiarizationError(
+                    "Cached diarization audio must be mono 16 kHz PCM"
+                )
+            with wave.open(str(output_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                clip_cursor_frames = 0
+                for utterance in utterances:
+                    start_frame = round(
+                        max(0, utterance.start_ms - 150) * sample_rate / 1_000
+                    )
+                    requested_end_frame = round(
+                        (utterance.end_ms + 150) * sample_rate / 1_000
+                    )
+                    start_frame = min(start_frame, source.getnframes())
+                    end_frame = min(requested_end_frame, source.getnframes())
+                    source.setpos(start_frame)
+                    frames = source.readframes(max(0, end_frame - start_frame))
+                    frame_count = len(frames) // 2
+                    if frame_count == 0:
+                        raise DiarizationError(
+                            "Diarization timestamps exceed the source audio"
+                        )
+                    utterance.clip_start_ms = round(
+                        clip_cursor_frames * 1_000 / sample_rate
+                    )
+                    output.writeframesraw(frames)
+                    clip_cursor_frames += frame_count
+                    utterance.clip_end_ms = round(
+                        clip_cursor_frames * 1_000 / sample_rate
+                    )
+    except (EOFError, wave.Error) as error:
+        raise DiarizationError(
+            "Could not assemble cached diarization utterances"
+        ) from error
 
 
 def _read_wave(path: Path) -> tuple[np.ndarray, int]:
@@ -189,9 +187,7 @@ def _read_wave(path: Path) -> tuple[np.ndarray, int]:
 def _embedding_session() -> ort.InferenceSession:
     model_path = Path(settings.diarization_model_path)
     if not model_path.is_file():
-        raise DiarizationError(
-            f"Speaker embedding model was not found at {model_path}"
-        )
+        raise DiarizationError(f"Speaker embedding model was not found at {model_path}")
     return ort.InferenceSession(
         str(model_path),
         providers=["CPUExecutionProvider"],
@@ -278,13 +274,9 @@ def _cluster_embeddings(
                     best_similarity = similarity
                     best_pair = (left_index, right_index)
         must_reduce = len(clusters) > settings.diarization_max_speakers
-        if (
-            best_pair is None
-            or (
-                not must_reduce
-                and best_similarity
-                < settings.diarization_similarity_threshold
-            )
+        if best_pair is None or (
+            not must_reduce
+            and best_similarity < settings.diarization_similarity_threshold
         ):
             break
         left_index, right_index = best_pair
@@ -295,17 +287,14 @@ def _cluster_embeddings(
     labels = [0] * len(embeddings)
     confidences = [0.0] * len(embeddings)
     for index, embedding in enumerate(embeddings):
-        similarities = [
-            float(np.dot(embedding, centroid)) for centroid in centroids
-        ]
+        similarities = [float(np.dot(embedding, centroid)) for centroid in centroids]
         label = int(np.argmax(similarities))
         labels[index] = label
         confidences[index] = max(0.0, min(1.0, similarities[label]))
 
     first_occurrence = {
         label: min(
-            index for index, item_label in enumerate(labels)
-            if item_label == label
+            index for index, item_label in enumerate(labels) if item_label == label
         )
         for label in set(labels)
     }

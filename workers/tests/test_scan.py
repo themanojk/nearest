@@ -1,10 +1,16 @@
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from audio_workers.contracts import ScanRequest
-from audio_workers.scan import AudioScanError, ScanAccumulator, validate_source_url
+from audio_workers.scan import (
+    AudioScanError,
+    ScanAccumulator,
+    scan_audio,
+    validate_source_url,
+)
 
 
 class AlwaysSpeechDetector:
@@ -89,4 +95,23 @@ def test_source_url_is_restricted_to_configured_hosts() -> None:
         validate_source_url(
             "http://169.254.169.254/latest/meta-data",
             {"127.0.0.1"},
+        )
+
+
+def test_scan_deadline_fires_when_decoder_produces_no_output(
+    tmp_path: Path,
+) -> None:
+    stalled_decoder = tmp_path / "stalled-decoder"
+    stalled_decoder.write_text("#!/bin/sh\nexec sleep 5\n", encoding="utf-8")
+    stalled_decoder.chmod(0o700)
+    request = ScanRequest(
+        analysis_id="analysis-1",
+        source_url="http://127.0.0.1/audio",
+    )
+
+    with pytest.raises(AudioScanError, match="exceeded its time limit"):
+        scan_audio(
+            request,
+            ffmpeg_path=str(stalled_decoder),
+            timeout_seconds=1,
         )

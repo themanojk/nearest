@@ -6,6 +6,7 @@ import time
 import wave
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from audio_workers.config import settings
 
@@ -26,7 +27,7 @@ def ensure_normalized_audio(
 ) -> Path:
     cache_dir = Path(settings.asr_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_key = hashlib.sha256(analysis_id.encode()).hexdigest()
+    cache_key = _cache_key(analysis_id, source_url)
     target = cache_dir / f"{cache_key}.wav"
     lock = _lock_for(cache_key)
     with lock:
@@ -56,17 +57,24 @@ def ensure_normalized_audio(
             "-y",
             str(temporary),
         ]
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        if process.returncode != 0 or not _is_valid_wave(temporary):
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
             _remove_if_present(temporary)
             raise AudioCacheError(
-                "FFmpeg could not normalize the source audio for ASR"
-            )
+                "FFmpeg timed out while normalizing the source audio"
+            ) from error
+        except OSError as error:
+            _remove_if_present(temporary)
+            raise AudioCacheError("FFmpeg could not be started") from error
+        if process.returncode != 0 or not _is_valid_wave(temporary):
+            _remove_if_present(temporary)
+            raise AudioCacheError("FFmpeg could not normalize the source audio for ASR")
         temporary.replace(target)
         return target
 
@@ -74,6 +82,15 @@ def ensure_normalized_audio(
 def _lock_for(cache_key: str) -> threading.Lock:
     with _locks_guard:
         return _analysis_locks.setdefault(cache_key, threading.Lock())
+
+
+def _cache_key(analysis_id: str, source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    stable_source = urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "")
+    )
+    identity = f"{analysis_id}\0{stable_source}".encode()
+    return hashlib.sha256(identity).hexdigest()
 
 
 def _is_valid_wave(path: Path) -> bool:

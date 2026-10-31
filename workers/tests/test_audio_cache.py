@@ -1,6 +1,7 @@
 import wave
 from pathlib import Path
 
+from audio_workers.audio_cache import _cache_key
 from audio_workers.contracts import TranscriptionRange, TranscriptionRequest
 from audio_workers.transcribe import _assemble_ranges
 
@@ -14,9 +15,7 @@ def test_direct_pcm_assembly_concatenates_selected_ranges(
         source.setsampwidth(2)
         source.setframerate(16_000)
         source.writeframes(
-            b"\x01\x00" * 16_000
-            + b"\x02\x00" * 16_000
-            + b"\x03\x00" * 16_000
+            b"\x01\x00" * 16_000 + b"\x02\x00" * 16_000 + b"\x03\x00" * 16_000
         )
     request = TranscriptionRequest(
         analysis_id="analysis-1",
@@ -38,3 +37,16 @@ def test_direct_pcm_assembly_concatenates_selected_ranges(
     assert len(frames) == 2 * 16_000 * 2
     assert frames[:2] == b"\x01\x00"
     assert frames[-2:] == b"\x03\x00"
+
+
+def test_cache_key_includes_source_identity() -> None:
+    assert _cache_key("analysis-1", "http://localhost/one") != _cache_key(
+        "analysis-1", "http://localhost/two"
+    )
+    assert _cache_key(
+        "analysis-1",
+        "http://localhost/one?signature=first",
+    ) == _cache_key(
+        "analysis-1",
+        "http://localhost/one?signature=second",
+    )

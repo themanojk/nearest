@@ -3,6 +3,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
+from audio_workers.config import settings
+
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(
@@ -69,8 +71,8 @@ class ScanResponse(ApiModel):
 
 
 class TranscriptionRange(ApiModel):
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
+    start_ms: int = Field(ge=0, le=settings.max_timeline_ms)
+    end_ms: int = Field(gt=0, le=settings.max_timeline_ms)
 
 
 class TranscriptionRequest(ApiModel):
@@ -79,7 +81,10 @@ class TranscriptionRequest(ApiModel):
     source_url: str = Field(min_length=1, max_length=8192)
     start_ms: int = Field(ge=0)
     end_ms: int = Field(gt=0)
-    ranges: list[TranscriptionRange] = Field(min_length=1)
+    ranges: list[TranscriptionRange] = Field(
+        min_length=1,
+        max_length=settings.max_selected_ranges,
+    )
     language_mode: Literal["AUTO", "ENGLISH", "HINDI_HINGLISH"] = "AUTO"
 
     @model_validator(mode="after")
@@ -88,6 +93,11 @@ class TranscriptionRequest(ApiModel):
             raise ValueError("endMs must be greater than startMs")
         if any(item.end_ms <= item.start_ms for item in self.ranges):
             raise ValueError("every transcription range must have positive duration")
+        if any(
+            current.start_ms < previous.end_ms
+            for previous, current in zip(self.ranges, self.ranges[1:], strict=False)
+        ):
+            raise ValueError("transcription ranges must be ordered and non-overlapping")
         duration_ms = sum(item.end_ms - item.start_ms for item in self.ranges)
         if duration_ms > 120_000:
             raise ValueError("selected transcription audio must not exceed 120 seconds")
@@ -124,15 +134,15 @@ class TranscriptionResponse(ApiModel):
 
 
 class DiarizationWord(ApiModel):
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
-    text: str = Field(min_length=1)
+    start_ms: int = Field(ge=0, le=settings.max_timeline_ms)
+    end_ms: int = Field(gt=0, le=settings.max_timeline_ms)
+    text: str = Field(min_length=1, max_length=settings.max_context_text_length)
 
 
 class DiarizationRequest(ApiModel):
     analysis_id: str = Field(min_length=1, max_length=128)
     source_url: str = Field(min_length=1, max_length=8192)
-    words: list[DiarizationWord]
+    words: list[DiarizationWord] = Field(max_length=settings.max_diarization_words)
 
     @model_validator(mode="after")
     def validate_words(self) -> "DiarizationRequest":
@@ -158,24 +168,43 @@ class DiarizationResponse(ApiModel):
 
 
 class ContextUtterance(ApiModel):
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
+    start_ms: int = Field(ge=0, le=settings.max_timeline_ms)
+    end_ms: int = Field(gt=0, le=settings.max_timeline_ms)
     speaker_id: str = Field(min_length=1)
-    text: str
+    text: str = Field(max_length=settings.max_context_text_length)
     confidence: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> "ContextUtterance":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("context utterance endMs must be greater than startMs")
+        return self
 
 
 class ContextSession(ApiModel):
     session_id: str = Field(min_length=1)
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
+    start_ms: int = Field(ge=0, le=settings.max_timeline_ms)
+    end_ms: int = Field(gt=0, le=settings.max_timeline_ms)
     speakers: list[str]
-    utterances: list[ContextUtterance]
+    utterances: list[ContextUtterance] = Field(
+        max_length=settings.max_context_utterances_per_session
+    )
+
+    @model_validator(mode="after")
+    def validate_session(self) -> "ContextSession":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("context session endMs must be greater than startMs")
+        if any(
+            utterance.start_ms < self.start_ms or utterance.end_ms > self.end_ms
+            for utterance in self.utterances
+        ):
+            raise ValueError("context utterances must fall within their session")
+        return self
 
 
 class ContextClassificationRequest(ApiModel):
     analysis_id: str = Field(min_length=1, max_length=128)
-    sessions: list[ContextSession]
+    sessions: list[ContextSession] = Field(max_length=settings.max_context_sessions)
 
 
 class QualityAssessment(ApiModel):
@@ -238,20 +267,28 @@ class ContextClassificationResponse(ApiModel):
 
 
 class AcousticRange(ApiModel):
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
+    start_ms: int = Field(ge=0, le=settings.max_timeline_ms)
+    end_ms: int = Field(gt=0, le=settings.max_timeline_ms)
 
 
 class AcousticDetectionRequest(ApiModel):
     analysis_id: str = Field(min_length=1, max_length=128)
     chunk_id: str = Field(min_length=1, max_length=128)
     source_url: str = Field(min_length=1, max_length=8192)
-    ranges: list[AcousticRange] = Field(min_length=1)
+    ranges: list[AcousticRange] = Field(
+        min_length=1,
+        max_length=settings.max_selected_ranges,
+    )
 
     @model_validator(mode="after")
     def validate_ranges(self) -> "AcousticDetectionRequest":
         if any(item.end_ms <= item.start_ms for item in self.ranges):
             raise ValueError("every acoustic range must have positive duration")
+        if any(
+            current.start_ms < previous.end_ms
+            for previous, current in zip(self.ranges, self.ranges[1:], strict=False)
+        ):
+            raise ValueError("acoustic ranges must be ordered and non-overlapping")
         duration_ms = sum(item.end_ms - item.start_ms for item in self.ranges)
         if duration_ms > 120_000:
             raise ValueError("selected acoustic audio must not exceed 120 seconds")

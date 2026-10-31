@@ -21,7 +21,8 @@ CHILD_SAFETY_RULES = [
         "insult",
         "medium",
         r"\b(?:badtameez|badtamiz|bad tameez|besharam|bewakuf|bewakoof|nalayak"
-        r"|nikamma|nikammi|gadha|gadhi|saale|sala|saali)\b|(?<!\w)(?:बदतमीज़"
+        r"|nikamma|nikammi|gadha|gadhi|saale|saaley|saley|salay|sala|saali)\b"
+        r"|(?<!\w)(?:बदतमीज़"
         r"|बदतमीज|बेशर्म|बेवकूफ|बेवकूफ़|नालायक|निकम्मा|निकम्मी|साले|साली)(?!\w)",
     ),
     (

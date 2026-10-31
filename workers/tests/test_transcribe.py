@@ -13,7 +13,10 @@ from audio_workers.contracts import (
     TranscriptWord,
 )
 from audio_workers.transcribe import (
+    DecodeCandidate,
     _is_repetitive_hallucination,
+    _is_suspicious,
+    _language_options,
     map_clip_time_to_source,
     transcribe_audio,
 )
@@ -50,6 +53,7 @@ class FakeModel:
 class RetryFakeModel:
     def __init__(self) -> None:
         self.languages: list[str | None] = []
+        self.hotwords: list[str | None] = []
 
     def transcribe(
         self, audio: str, **kwargs: object
@@ -57,6 +61,10 @@ class RetryFakeModel:
         language = kwargs.get("language")
         self.languages.append(
             language if isinstance(language, str) else None
+        )
+        hotwords = kwargs.get("hotwords")
+        self.hotwords.append(
+            hotwords if isinstance(hotwords, str) else None
         )
         if language == "hi":
             return (
@@ -170,6 +178,21 @@ def test_transcription_rejects_oversized_ranges() -> None:
         )
 
 
+def test_transcription_rejects_overlapping_ranges() -> None:
+    with pytest.raises(ValidationError, match="ordered and non-overlapping"):
+        TranscriptionRequest(
+            analysis_id="analysis-1",
+            chunk_id="chunk-1",
+            source_url="http://127.0.0.1/audio",
+            start_ms=0,
+            end_ms=2_000,
+            ranges=[
+                TranscriptionRange(start_ms=0, end_ms=1_500),
+                TranscriptionRange(start_ms=1_000, end_ms=2_000),
+            ],
+        )
+
+
 def test_discontinuous_clip_time_maps_back_to_source() -> None:
     request = TranscriptionRequest(
         analysis_id="analysis-1",
@@ -194,6 +217,38 @@ def test_repeated_token_hallucination_is_rejected() -> None:
     ]
 
     assert _is_repetitive_hallucination(words)
+
+
+def test_hotwords_are_used_only_for_targeted_hinglish_retry() -> None:
+    auto_hotwords = _language_options("AUTO")["hotwords"]
+    hindi_hotwords = _language_options(
+        "HINDI_HINGLISH",
+        use_hotwords=True,
+    )["hotwords"]
+
+    assert auto_hotwords is None
+    assert isinstance(hindi_hotwords, str)
+    assert "saale" in hindi_hotwords.split()
+    assert "साले" in hindi_hotwords.split()
+    assert _language_options("HINDI_HINGLISH")["hotwords"] is None
+    assert _language_options("ENGLISH")["hotwords"] is None
+
+
+def test_low_confidence_word_triggers_selective_retry() -> None:
+    candidate = DecodeCandidate(
+        words=[
+            TranscriptWord(
+                start_ms=0,
+                end_ms=500,
+                text=" saley",
+                probability=0.4,
+            )
+        ],
+        info=SimpleNamespace(language="hi", language_probability=0.95),
+        audio_duration_after_vad=1.0,
+    )
+
+    assert _is_suspicious(candidate, "AUTO")
 
 
 def test_auto_mode_retries_wrong_script_and_selects_hinglish(
@@ -222,3 +277,6 @@ def test_auto_mode_retries_wrong_script_and_selects_hinglish(
     assert response.language == "hi"
     assert response.quality_retry_used
     assert model.languages == [None, "hi", "en"]
+    assert model.hotwords[0] is None
+    assert isinstance(model.hotwords[1], str)
+    assert model.hotwords[2] is None

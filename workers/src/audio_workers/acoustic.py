@@ -20,8 +20,7 @@ from audio_workers.contracts import (
 )
 
 MODEL_NAME = (
-    "sherpa-onnx-zipformer-small-audio-tagging/"
-    "2024-04-15-int8+health-multires/1.1.0"
+    "sherpa-onnx-zipformer-small-audio-tagging/2024-04-15-int8+health-multires/1.1.0"
 )
 
 EVENT_CLASSES: dict[str, tuple[str, str]] = {
@@ -150,13 +149,9 @@ def _detect_health_events(
     samples: np.ndarray,
     sample_rate: int,
 ) -> tuple[int, list[tuple[int, int, str, float]]]:
-    window_samples = round(
-        settings.health_window_ms * sample_rate / 1_000
-    )
+    window_samples = round(settings.health_window_ms * sample_rate / 1_000)
     hop_samples = round(settings.health_hop_ms * sample_rate / 1_000)
-    minimum_probability = min(
-        threshold() for threshold in HEALTH_THRESHOLDS.values()
-    )
+    minimum_probability = min(threshold() for threshold in HEALTH_THRESHOLDS.values())
     detections: list[tuple[int, int, str, float]] = []
     window_count = 0
     for start_sample in range(0, max(1, samples.size), hop_samples):
@@ -229,9 +224,7 @@ def _extract_ranges(
     if len(request.ranges) == 1:
         command.extend(["-map", "0:a:0"])
     else:
-        inputs = "".join(
-            f"[{index}:a:0]" for index in range(len(request.ranges))
-        )
+        inputs = "".join(f"[{index}:a:0]" for index in range(len(request.ranges)))
         command.extend(
             [
                 "-filter_complex",
@@ -252,12 +245,19 @@ def _extract_ranges(
             str(output_path),
         ]
     )
-    process = subprocess.run(
-        command,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AcousticDetectionError(
+            "FFmpeg timed out while extracting acoustic-event ranges"
+        ) from error
+    except OSError as error:
+        raise AcousticDetectionError("FFmpeg could not be started") from error
     if process.returncode != 0 or not output_path.exists():
         raise AcousticDetectionError(
             "FFmpeg could not extract the acoustic-event ranges"

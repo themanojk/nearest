@@ -7,6 +7,13 @@ class Settings(BaseSettings):
     allowed_audio_hosts: str = "localhost,127.0.0.1"
     ffmpeg_path: str = "ffmpeg"
     ffmpeg_timeout_seconds: int = 3600
+    api_token: str | None = None
+    max_diarization_words: int = 50_000
+    max_context_sessions: int = 1_000
+    max_context_utterances_per_session: int = 10_000
+    max_context_text_length: int = 10_000
+    max_selected_ranges: int = 128
+    max_timeline_ms: int = 86_400_000
     asr_model_size: str = "large-v3-turbo"
     asr_device: str = "cpu"
     asr_compute_type: str = "int8"
@@ -21,6 +28,8 @@ class Settings(BaseSettings):
     asr_vad_speech_pad_ms: int = 150
     asr_min_word_probability: float = 0.0
     asr_language_probability_threshold: float = 0.6
+    asr_quality_retry_min_word_probability: float = 0.55
+    asr_hotwords_path: str = "lexicons/hi_hinglish_safety.tsv"
     asr_cache_dir: str = "/private/tmp/kid-audio-asr-cache"
     asr_cache_ttl_seconds: int = 21_600
     diarization_max_speakers: int = 8
@@ -32,9 +41,7 @@ class Settings(BaseSettings):
         "models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
     )
     acoustic_model_path: str = "models/audio-tagging/model.int8.onnx"
-    acoustic_labels_path: str = (
-        "models/audio-tagging/class_labels_indices.csv"
-    )
+    acoustic_labels_path: str = "models/audio-tagging/class_labels_indices.csv"
     acoustic_window_ms: int = 10_000
     acoustic_min_probability: float = 0.35
     health_window_ms: int = 2_000

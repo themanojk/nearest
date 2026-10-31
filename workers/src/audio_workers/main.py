@@ -1,10 +1,16 @@
+import hmac
 import logging
+import os
+import shutil
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import HTTPException
+from faster_whisper.utils import download_model  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
 from audio_workers.acoustic import (
@@ -26,6 +32,7 @@ from audio_workers.contracts import (
     TranscriptionResponse,
 )
 from audio_workers.diarize import DiarizationError, diarize_audio
+from audio_workers.lexicon import LexiconError, load_hotwords
 from audio_workers.scan import AudioScanError, scan_audio, validate_source_url
 from audio_workers.transcribe import (
     TranscriptionError,
@@ -40,6 +47,25 @@ class HealthResponse(BaseModel):
     version: str
     status: Literal["ok"]
     timestamp: datetime
+
+
+class ReadinessResponse(BaseModel):
+    service: str
+    version: str
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, bool]
+    timestamp: datetime
+
+
+def require_worker_token(authorization: str | None = Header(default=None)) -> None:
+    if not settings.api_token:
+        return
+    expected = f"Bearer {settings.api_token}"
+    if authorization is None or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Invalid worker credentials")
+
+
+INFERENCE_DEPENDENCIES = [Depends(require_worker_token)]
 
 
 app = FastAPI(
@@ -59,7 +85,70 @@ async def health() -> HealthResponse:
     )
 
 
-@app.post("/v1/scan", response_model=ScanResponse, tags=["inference"])
+@app.get("/ready", response_model=ReadinessResponse, tags=["operations"])
+async def readiness(response: Response) -> ReadinessResponse:
+    ffmpeg = Path(settings.ffmpeg_path)
+    ffmpeg_available = (
+        ffmpeg.is_file() and os.access(ffmpeg, os.X_OK)
+        if ffmpeg.parent != Path(".")
+        else shutil.which(settings.ffmpeg_path) is not None
+    )
+    checks = {
+        "ffmpeg": ffmpeg_available,
+        "asr_model": _asr_model_available(),
+        "asr_hotword_lexicon": _hotword_lexicon_available(),
+        "diarization_model": Path(settings.diarization_model_path).is_file(),
+        "acoustic_model": Path(settings.acoustic_model_path).is_file(),
+        "acoustic_labels": Path(settings.acoustic_labels_path).is_file(),
+        "audio_cache": _cache_is_writable(),
+    }
+    ready = all(checks.values())
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return ReadinessResponse(
+        service=settings.service_name,
+        version=settings.service_version,
+        status="ready" if ready else "not_ready",
+        checks=checks,
+        timestamp=datetime.now(UTC),
+    )
+
+
+def _cache_is_writable() -> bool:
+    try:
+        cache_dir = Path(settings.asr_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=cache_dir):
+            return True
+    except OSError:
+        return False
+
+
+def _asr_model_available() -> bool:
+    configured_path = Path(settings.asr_model_size)
+    if configured_path.is_dir():
+        return True
+    try:
+        download_model(settings.asr_model_size, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def _hotword_lexicon_available() -> bool:
+    try:
+        load_hotwords(settings.asr_hotwords_path)
+        return True
+    except LexiconError:
+        return False
+
+
+@app.post(
+    "/v1/scan",
+    response_model=ScanResponse,
+    tags=["inference"],
+    dependencies=INFERENCE_DEPENDENCIES,
+)
 async def scan(request: ScanRequest) -> ScanResponse:
     try:
         logger.info("scan.started analysis_id=%s", request.analysis_id)
@@ -92,6 +181,7 @@ async def scan(request: ScanRequest) -> ScanResponse:
     "/v1/transcribe",
     response_model=TranscriptionResponse,
     tags=["inference"],
+    dependencies=INFERENCE_DEPENDENCIES,
 )
 async def transcribe(request: TranscriptionRequest) -> TranscriptionResponse:
     try:
@@ -142,6 +232,7 @@ async def transcribe(request: TranscriptionRequest) -> TranscriptionResponse:
     "/v1/diarize",
     response_model=DiarizationResponse,
     tags=["inference"],
+    dependencies=INFERENCE_DEPENDENCIES,
 )
 async def diarize(request: DiarizationRequest) -> DiarizationResponse:
     try:
@@ -179,6 +270,7 @@ async def diarize(request: DiarizationRequest) -> DiarizationResponse:
     "/v1/classify-context",
     response_model=ContextClassificationResponse,
     tags=["inference"],
+    dependencies=INFERENCE_DEPENDENCIES,
 )
 async def classify_conversation_context(
     request: ContextClassificationRequest,
@@ -202,6 +294,7 @@ async def classify_conversation_context(
     "/v1/detect-acoustic-events",
     response_model=AcousticDetectionResponse,
     tags=["inference"],
+    dependencies=INFERENCE_DEPENDENCIES,
 )
 async def detect_events(
     request: AcousticDetectionRequest,

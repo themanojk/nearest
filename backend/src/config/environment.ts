@@ -35,6 +35,7 @@ interface Environment {
   UPLOAD_URL_TTL_SECONDS: number;
   VAD_MODE: number;
   WORKER_BASE_URL: string;
+  WORKER_API_TOKEN?: string;
   WORKER_REQUEST_TIMEOUT_MS: number;
 }
 
@@ -65,6 +66,15 @@ function stringValue(
     throw new Error(`${key} must not be empty`);
   }
   return value;
+}
+
+function optionalStringValue(
+  config: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const raw = config[key];
+  if (typeof raw !== 'string') return undefined;
+  return raw.trim() || undefined;
 }
 
 function booleanValue(
@@ -219,6 +229,7 @@ export function validateEnvironment(
       'WORKER_BASE_URL',
       'http://localhost:8000',
     ),
+    WORKER_API_TOKEN: optionalStringValue(config, 'WORKER_API_TOKEN'),
     WORKER_REQUEST_TIMEOUT_MS: numberValue(
       config,
       'WORKER_REQUEST_TIMEOUT_MS',

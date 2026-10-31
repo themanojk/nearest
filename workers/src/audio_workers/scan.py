@@ -1,4 +1,6 @@
 import math
+import os
+import selectors
 import subprocess
 import time
 from collections import deque
@@ -108,10 +110,7 @@ class ScanAccumulator:
     def finalize(self, processing_seconds: float) -> ScanResponse:
         if self.speech_start_frame is not None:
             self._close_speech_interval(self.frame_index)
-        if (
-            self.metrics
-            and self.metrics[-1].index + 1 > self.last_window_end_frame
-        ):
+        if self.metrics and self.metrics[-1].index + 1 > self.last_window_end_frame:
             self._emit_window(len(self.metrics))
 
         intervals = self._merge_speech_intervals()
@@ -120,9 +119,7 @@ class ScanAccumulator:
             interval.end_ms - interval.start_ms for interval in intervals
         )
         speech_ratio = (
-            speech_duration_ms / decoded_duration_ms
-            if decoded_duration_ms > 0
-            else 0.0
+            speech_duration_ms / decoded_duration_ms if decoded_duration_ms > 0 else 0.0
         )
 
         return ScanResponse(
@@ -235,44 +232,62 @@ def scan_audio(
 ) -> ScanResponse:
     started_at = time.monotonic()
     accumulator = ScanAccumulator(request)
-    process = subprocess.Popen(
-        [
-            ffmpeg_path,
-            "-nostdin",
-            "-v",
-            "error",
-            "-i",
-            request.source_url,
-            "-map",
-            "0:a:0",
-            "-ac",
-            "1",
-            "-ar",
-            str(request.sample_rate),
-            "-f",
-            "s16le",
-            "pipe:1",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        process = subprocess.Popen(
+            [
+                ffmpeg_path,
+                "-nostdin",
+                "-v",
+                "error",
+                "-i",
+                request.source_url,
+                "-map",
+                "0:a:0",
+                "-ac",
+                "1",
+                "-ar",
+                str(request.sample_rate),
+                "-f",
+                "s16le",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise AudioScanError("FFmpeg could not be started") from error
 
+    selector = selectors.DefaultSelector()
     try:
         if process.stdout is None:
             raise AudioScanError("FFmpeg stdout was not available")
-        while chunk := process.stdout.read(64 * 1024):
-            if time.monotonic() - started_at > timeout_seconds:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = started_at + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise AudioScanError("Audio scan exceeded its time limit")
+            events = selector.select(timeout=min(0.5, remaining))
+            if not events:
+                if process.poll() is not None:
+                    break
+                continue
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
             accumulator.consume(chunk)
 
-        return_code = process.wait(timeout=10)
+        try:
+            return_code = process.wait(timeout=min(10, timeout_seconds))
+        except subprocess.TimeoutExpired as error:
+            raise AudioScanError("FFmpeg did not terminate after decoding") from error
         if return_code != 0:
             raise AudioScanError("FFmpeg could not decode the audio object")
         return accumulator.finalize(time.monotonic() - started_at)
     finally:
+        selector.close()
         if process.poll() is None:
             process.kill()
+            process.wait()
         if process.stdout is not None:
             process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()

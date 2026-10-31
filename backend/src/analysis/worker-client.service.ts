@@ -101,16 +101,27 @@ export class WorkerClientService {
   private readonly timeoutMs: number;
   private readonly vadMode: number;
   private readonly windowMs: number;
+  private readonly apiToken: string | undefined;
 
   constructor(config: ConfigService) {
     this.baseUrl = config.getOrThrow<string>('WORKER_BASE_URL').replace(
       /\/$/,
       '',
     );
+    this.apiToken = config.get<string>('WORKER_API_TOKEN');
     this.timeoutMs = config.getOrThrow<number>('WORKER_REQUEST_TIMEOUT_MS');
     this.windowMs = config.getOrThrow<number>('SCAN_WINDOW_MS');
     this.overlapMs = config.getOrThrow<number>('SCAN_OVERLAP_MS');
     this.vadMode = config.getOrThrow<number>('VAD_MODE');
+  }
+
+  private requestHeaders(): Record<string, string> {
+    return {
+      'content-type': 'application/json',
+      ...(this.apiToken
+        ? { authorization: `Bearer ${this.apiToken}` }
+        : {}),
+    };
   }
 
   async scanAudio(
@@ -121,9 +132,7 @@ export class WorkerClientService {
     try {
       response = await fetch(`${this.baseUrl}/v1/scan`, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
+        headers: this.requestHeaders(),
         body: JSON.stringify({
           analysisId,
           sourceUrl,
@@ -165,7 +174,7 @@ export class WorkerClientService {
     try {
       response = await fetch(`${this.baseUrl}/v1/transcribe`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: this.requestHeaders(),
         body: JSON.stringify({
           analysisId,
           chunkId,
@@ -207,7 +216,7 @@ export class WorkerClientService {
     try {
       response = await fetch(`${this.baseUrl}/v1/diarize`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: this.requestHeaders(),
         body: JSON.stringify({ analysisId, sourceUrl, words }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
@@ -249,7 +258,7 @@ export class WorkerClientService {
     try {
       response = await fetch(`${this.baseUrl}/v1/classify-context`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: this.requestHeaders(),
         body: JSON.stringify({ analysisId, sessions }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
@@ -280,7 +289,7 @@ export class WorkerClientService {
         `${this.baseUrl}/v1/detect-acoustic-events`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: this.requestHeaders(),
           body: JSON.stringify({
             analysisId,
             chunkId,

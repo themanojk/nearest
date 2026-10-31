@@ -19,6 +19,7 @@ from audio_workers.contracts import (
     TranscriptionResponse,
     TranscriptWord,
 )
+from audio_workers.lexicon import LexiconError, load_hotwords
 
 
 class TranscriptionError(RuntimeError):
@@ -144,9 +145,9 @@ def transcribe_audio(
             options = fallback_options
 
         quality_retry_used = False
-        retry_modes = _retry_modes(request.language_mode)
+        retry_strategies = _retry_strategies(request.language_mode)
         if (
-            retry_modes
+            retry_strategies
             and _is_suspicious(candidate, request.language_mode)
         ):
             retry_candidates = [
@@ -156,11 +157,14 @@ def transcribe_audio(
                     request,
                     {
                         **options,
-                        **_language_options(retry_mode),
+                        **_language_options(
+                            retry_mode,
+                            use_hotwords=use_hotwords,
+                        ),
                         "condition_on_previous_text": False,
                     },
                 )
-                for retry_mode in retry_modes
+                for retry_mode, use_hotwords in retry_strategies
             ]
             candidate = max(
                 [candidate, *retry_candidates],
@@ -195,14 +199,29 @@ def transcribe_audio(
     )
 
 
-def _language_options(language_mode: str) -> dict[str, object]:
+def _language_options(
+    language_mode: str,
+    *,
+    use_hotwords: bool = False,
+) -> dict[str, object]:
     if language_mode == "ENGLISH":
-        return {"language": "en", "multilingual": False}
+        return {
+            "language": "en",
+            "multilingual": False,
+            "hotwords": None,
+        }
     if language_mode == "HINDI_HINGLISH":
-        return {"language": "hi", "multilingual": True}
+        return {
+            "language": "hi",
+            "multilingual": True,
+            "hotwords": (
+                _hindi_hinglish_hotwords() if use_hotwords else None
+            ),
+        }
     return {
         "language": None,
         "multilingual": True,
+        "hotwords": _hindi_hinglish_hotwords() if use_hotwords else None,
         "language_detection_segments": 3,
         "language_detection_threshold": (
             settings.asr_language_probability_threshold
@@ -210,11 +229,22 @@ def _language_options(language_mode: str) -> dict[str, object]:
     }
 
 
-def _retry_modes(language_mode: str) -> list[str]:
+def _hindi_hinglish_hotwords() -> str | None:
+    try:
+        return load_hotwords(settings.asr_hotwords_path)
+    except LexiconError as error:
+        raise TranscriptionError(str(error)) from error
+
+
+def _retry_strategies(language_mode: str) -> list[tuple[str, bool]]:
     if language_mode == "AUTO":
-        return ["HINDI_HINGLISH", "ENGLISH"]
+        return [("HINDI_HINGLISH", True), ("ENGLISH", False)]
     if language_mode == "HINDI_HINGLISH":
-        return ["AUTO", "ENGLISH"]
+        return [
+            ("HINDI_HINGLISH", True),
+            ("AUTO", False),
+            ("ENGLISH", False),
+        ]
     return []
 
 
@@ -272,6 +302,17 @@ def _is_suspicious(
     if language_mode == "AUTO" and language not in {"en", "hi"}:
         return True
     if probability < settings.asr_language_probability_threshold:
+        return True
+    word_probabilities = [
+        word.probability
+        for word in words
+        if word.probability is not None
+    ]
+    if (
+        word_probabilities
+        and min(word_probabilities)
+        < settings.asr_quality_retry_min_word_probability
+    ):
         return True
     text = "".join(word.text for word in words)
     if _unexpected_script_ratio(text) > 0.1:

@@ -229,7 +229,8 @@ _PROFANITY_ALIASES.extend(
             "moderate",
             0.85,
             re.compile(
-                r"(?<!\w)(?:saale|sala|saali|साला|साले|साली)(?!\w)", re.IGNORECASE
+                r"(?<!\w)(?:saale|saaley|saley|salay|sala|saali|साला|साले|साली)(?!\w)",
+                re.IGNORECASE,
             ),
         ),
         _ProfanityRule(

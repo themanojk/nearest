@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "caseCount": 120,
+  "phraseCount": 30,
+  "profiles": [
+    "clean",
+    "soft",
+    "fast",
+    "noisy"
+  ],
+  "limitations": [
+    "Adult synthetic voices only",
+    "Not representative of spontaneous child speech",
+    "Not suitable as sole evidence for production safety claims"
+  ]
+}
